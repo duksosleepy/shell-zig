@@ -1,10 +1,16 @@
 const std = @import("std");
 
+const io = std.io;
+
+const mem = std.mem;
+
+const process = std.process;
+
 pub fn main() !void {
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = io.getStdOut().writer();
 
-    const stdin = std.io.getStdIn().reader();
+    const stdin = io.getStdIn().reader();
 
     while (true) {
 
@@ -14,26 +20,25 @@ pub fn main() !void {
 
         const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
 
-        var iter = std.mem.splitScalar(u8, user_input, ' ');
+        var commands = mem.splitSequence(u8, user_input, " ");
 
-        const command = iter.next();
+        const command = commands.first();
 
-        if (command) |c| {
+        const args = commands.rest();
 
-            if (std.mem.eql(u8, c, "exit")) {
-                const exit_code = try std.fmt.parseInt(u8, iter.next() orelse "0", 10);
+        if (mem.eql(u8, command, "exit")) {
 
-                std.process.exit(exit_code);
+            process.exit(args[0] - '0'); //example '5'(ASCII value of 53) - '0'(ASCII value of 48) = 5
 
-            } else {
+        } else if (mem.eql(u8, command, "echo")) {
 
-                try stdout.print("{s}: command not found\n", .{c});
+            _ = try stdout.write(args);
 
-            }
+            _ = try stdout.write("\n");
 
         } else {
 
-            // Do nothing
+            try stdout.print("{s}: command not found\n", .{user_input});
 
         }
 
