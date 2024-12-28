@@ -16,7 +16,7 @@ pub fn main() !void {
 
     // TODO: Handle user input
 
-    _ = user_input;
+    //_ = user_input;
 
     var it = std.mem.split(u8, user_input, " ");
 
