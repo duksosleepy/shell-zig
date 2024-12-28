@@ -1,27 +1,30 @@
 const std = @import("std");
 
+const io = std.io;
+
 pub fn main() !void {
 
-    // Uncomment this block to pass the first stage
-
-    const stdout = std.io.getStdOut().writer();
+    const stdout = io.getStdOut().writer();
 
     try stdout.print("$ ", .{});
 
-    const stdin = std.io.getStdIn().reader();
+    const stdin = io.getStdIn().reader();
 
     var buffer: [1024]u8 = undefined;
 
     const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
 
-    // TODO: Handle user input
+    try stdout.print("{s}: command not found\n", .{user_input});
 
-    //_ = user_input;
+    while (true) {
 
-    var it = std.mem.split(u8, user_input, " ");
+        try stdout.print("$ ", .{});
 
-    const command = it.next().?;
+        var buffer: [1024]u8 = undefined;
 
-    stdout.print("{s}: command not found\n", .{command}) catch {};
+        const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
+
+        try stdout.print("{s}: command not found\n", .{user_input});
+    }
 
 }
