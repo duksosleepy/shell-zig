@@ -72,7 +72,8 @@ const echo_command = Command{
 
                 // }
 
-                parsed_args.deinit();
+
+                parsed_args.args.deinit();
 
             }
 
@@ -84,7 +85,22 @@ const echo_command = Command{
 
             // }
 
-            for (parsed_args.items, 0..) |arg, i| {
+            //
+
+            const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
+
+            if (parsed_args.redirect_info) |redirect_info| {
+
+                // std.debug.print("redirect_info present, should redirect.\n", .{});
+
+                // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
+
+
+                try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO);
+
+            }
+
+            for (parsed_args.args.items, 0..) |arg, i| {
 
                 if (i > 0) try writer.print(" ", .{});
 
@@ -94,19 +110,50 @@ const echo_command = Command{
 
             try writer.print("\n", .{});
 
+            if (parsed_args.redirect_info) |_| {
+
+                try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO);
+
+            }
+
         }
 
     }.handler,
 
 };
 
-fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayList([]const u8) {
 
-    var result = std.ArrayList([]const u8).init(allocator);
+const CommandData = struct { args: std.ArrayList([]const u8), redirect_info: ?struct {
 
-    errdefer result.deinit();
+    fd: i32,
 
-    if (args.len == 0) return result;
+    target_file: []const u8,
+
+} };
+
+const ArgType = union(enum) {
+
+    command_arg: []const u8,
+
+    redirect: struct {
+
+        fd: u8,
+
+        target_file: []const u8,
+
+    },
+
+};
+
+fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !CommandData {
+
+    // std.debug.print("parseQuotedArgs called. args.len: {d}\n", .{args.len});
+
+    var command_data = CommandData{ .args = std.ArrayList([]const u8).init(allocator), .redirect_info = undefined };
+
+    errdefer command_data.args.deinit();
+
+    if (args.len == 0) return command_data;
 
     var current_arg = std.ArrayList(u8).init(allocator);
 
@@ -124,7 +171,9 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
 
             if (current_arg.items.len > 0) {
 
-                try result.append(try allocator.dupe(u8, current_arg.items));
+                const result_item = try allocator.dupe(u8, current_arg.items);
+
+                try command_data.args.append(result_item);
 
                 current_arg.clearRetainingCapacity();
 
@@ -196,6 +245,64 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
 
             while (arg_index < args.len) {
 
+                // std.debug.print("checking if redirect\n", .{});
+
+                // std.debug.print("arg_index: {d}\n", .{arg_index});
+
+                if (is_redirect(args, &arg_index)) {
+
+                    // std.debug.print("redirect detected\n", .{});
+
+                    // std.debug.print("arg_index: {d}\n", .{arg_index});
+
+                    var redirect_destination = std.ArrayList(u8).init(allocator);
+
+                    // Need to eat the next space to get to the redirect target
+
+                    arg_index += 1;
+
+                    // We don't want to crash here but we should report the error.
+
+                    if (arg_index >= args.len) break;
+
+                    while (arg_index < args.len) {
+
+                        // std.debug.print("in redirect parsing loop. arg_index: {d}\n", .{arg_index});
+
+                        if (args[arg_index] == ' ') {
+
+                            break;
+
+                        }
+
+                        // std.debug.print("appending to redirect_destination from: {d}\n", .{arg_index});
+
+                        // std.debug.print("args[{d}] = {c}\n", .{ arg_index, args[arg_index] });
+
+                        try redirect_destination.append(args[arg_index]);
+
+                        arg_index += 1;
+
+                    }
+
+                    // std.debug.print("end of redirect detected at: {d}\n", .{arg_index});
+
+                    arg_index += 1;
+
+                    const redirect_item = try allocator.dupe(u8, redirect_destination.items);
+
+                    const file = try std.fs.cwd().createFile(redirect_item, .{ .read = true });
+
+                    // std.debug.print("fd: {d}\n", .{file.handle});
+
+                    command_data.redirect_info = .{ .fd = file.handle, .target_file = redirect_item };
+
+                    break;
+
+                }
+
+                if (arg_index >= args.len) break;
+
                 if (args[arg_index] == ' ') break;
 
                 if (args[arg_index] == '\\' and arg_index + 1 < args.len) {
@@ -222,11 +329,43 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
 
     if (current_arg.items.len > 0) {
 
-        try result.append(try allocator.dupe(u8, current_arg.items));
+
+        const result_item = try allocator.dupe(u8, current_arg.items);
+
+        try command_data.args.append(result_item);
 
     }
 
-    return result;
+
+    return command_data;
+
+}
+
+fn is_redirect(args: []const u8, index: *usize) bool {
+
+    if (args.len <= index.* + 1) {
+
+        return false;
+
+    }
+
+    if (args[index.*] == '1' and args[index.* + 1] == '>') {
+
+        index.* = index.* + 2;
+
+        return true;
+
+    }
+
+    if (args[index.*] == '>') {
+
+        index.* = index.* + 1;
+
+        return true;
+
+    }
+
+    return false;
 
 }
 
@@ -446,7 +585,6 @@ pub fn main() !u8 {
 
         };
 
-
         const ParsingState = enum { normal, in_single_quote, in_double_quote };
 
         var i: usize = 0;
@@ -571,15 +709,22 @@ pub fn main() !u8 {
 
                         // }
 
-                        parsed_args.deinit();
+
+                        parsed_args.args.deinit();
 
                     }
 
-                    for (parsed_args.items) |arg| {
+                    for (parsed_args.args.items) |arg| {
 
                         try argv.append(arg);
 
                     }
+
+                    // if (parsed_args.redirect_info) |_| {
+
+                    //     std.debug.print("redirect_info present, should redirect.\n", .{});
+
+                    // }
 
                     // Before executing the command:
 
@@ -591,9 +736,31 @@ pub fn main() !u8 {
 
                     // }
 
+                    //
+
+                    //
+
+                    const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
+
+                    if (parsed_args.redirect_info) |redirect_info| {
+
+                        // std.debug.print("redirect_info present, should redirect.\n", .{});
+
+                        // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
+
+                        try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO);
+
+                    }
+
                     var child = std.process.Child.init(argv.items, allocator);
 
                     _ = try child.spawnAndWait();
+
+                    if (parsed_args.redirect_info) |_| {
+
+                        try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO);
+
+                    }
 
                     defer exe.deinit();
 
