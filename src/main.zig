@@ -140,7 +140,6 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
 
         if (args[arg_index] == '\'') {
 
-
             // Single quotes - everything is literal
 
             arg_index += 1;
@@ -152,7 +151,6 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
             arg_index += quote_end + 1;
 
         } else if (args[arg_index] == '"') {
-
 
             // Double quotes - only process specific escapes
 
@@ -183,6 +181,7 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
                     }
 
                 } else {
+
                     try current_arg.append(args[arg_index]);
 
                     arg_index += 1;
@@ -192,6 +191,8 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
             }
 
         } else {
+
+            // Unquoted - process until space or quote
 
             while (arg_index < args.len) {
 
@@ -211,9 +212,7 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayLis
 
                 arg_index += 1;
 
-
             }
-
 
         }
 
@@ -447,11 +446,92 @@ pub fn main() !u8 {
 
         };
 
-        var inputs = std.mem.splitAny(u8, user_input, " ");
 
-        const command = inputs.first();
+        const ParsingState = enum { normal, in_single_quote, in_double_quote };
 
-        const args = inputs.rest();
+        var i: usize = 0;
+
+        var command_buffer = std.ArrayList(u8).init(allocator);
+
+        defer command_buffer.deinit();
+
+        var parsing_state = ParsingState.normal;
+
+        for (user_input) |c| {
+
+            switch (c) {
+
+                ' ' => {
+
+                    if (parsing_state == ParsingState.normal) {
+
+                        break;
+
+                    } else {
+
+                        try command_buffer.append(c);
+
+                    }
+
+                },
+
+                '"' => {
+
+                    switch (parsing_state) {
+
+                        ParsingState.in_double_quote => parsing_state = ParsingState.normal,
+
+                        ParsingState.normal => parsing_state = ParsingState.in_double_quote,
+
+                        else => try command_buffer.append(c),
+
+                    }
+
+                },
+
+                '\'' => {
+
+                    switch (parsing_state) {
+
+                        ParsingState.in_single_quote => parsing_state = ParsingState.normal,
+
+                        ParsingState.normal => parsing_state = ParsingState.in_single_quote,
+
+                        else => try command_buffer.append(c),
+
+                    }
+
+                },
+
+                else => try command_buffer.append(c),
+
+            }
+
+            i += 1;
+
+        }
+
+        const command = command_buffer.items;
+
+        var args: []u8 = "";
+
+        if (i < user_input.len) {
+
+            args = user_input[i + 1 ..];
+
+        }
+
+        //         var inputs = std.mem.splitAny(u8, user_input, " ");
+
+        //         const command = inputs.first();
+
+        //         const args = inputs.rest();
+
+        //
+
+        // std.debug.print("command: {s}\n", .{command});
+
+        // std.debug.print("args: {s}\n", .{args});
 
         if (commands.get(command)) |cmd| {
 
