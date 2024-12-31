@@ -1,965 +1,382 @@
 const std = @import("std");
+const mem = std.mem;
+const util = @import("util.zig");
+const Pal = @import("pal.zig").Current;
 
-const ShellState = struct {
+const debug = true;
 
-    should_exit: bool = false,
+fn trace(comptime format: []const u8, args: anytype) void {
+    if (debug) {
+        const writer = std.io.getStdOut().writer();
+        writer.print("  TRACE | ", .{}) catch unreachable;
+        writer.print(format, args) catch unreachable;
+        writer.print("\n", .{}) catch unreachable;
+    }
+}
 
-    exit_code: u8 = 0,
+const Target = union(enum) {
+    stdout: void,
+    stderr: void,
+    file: std.fs.File,
 
-    executables: std.StringHashMap(Executable),
+    pub fn deinit(self: *const Target) void {
+        switch (self.*) {
+            .file => |handle| {
+                handle.close();
+            },
+            else => {},
+        }
+    }
 
-    env_path: []const u8,
+    pub fn fileTruncate(path: []const u8) !Target {
+        const file = try std.fs.cwd().createFile(path, .{
+            .read = false,
+            .truncate = true,
+        });
 
-    allocator: std.mem.Allocator,
+        return Target{ .file = file };
+    }
 
-    pub fn init(allocator: std.mem.Allocator) ShellState {
+    pub fn fileAppend(path: []const u8) !Target {
+        const file = try std.fs.cwd().createFile(path, .{
+            .read = false,
+            .truncate = false,
+        });
 
-        return .{
+        try file.seekFromEnd(0);
 
-            .should_exit = false,
+        return Target{ .file = file };
+    }
+};
+const Input = struct {
+    tokens: []const []const u8,
+    out_target: Target,
+    err_target: Target,
 
-            .exit_code = 0,
+    pub fn deinit(self: *Input) void {
+        self.out_target.deinit();
+        self.err_target.deinit();
+    }
 
-            .env_path = "",
-
-            .executables = std.StringHashMap(Executable).init(allocator),
-
-            .allocator = allocator,
-
+    pub fn empty() Input {
+        return Input{
+            .tokens = &[0][]const u8{},
+            .out_target = .stdout,
+            .err_target = .stderr,
         };
-
     }
+};
+const Result = union(enum) {
+    exit: u8,
+    cont,
 
-    pub fn deinit(self: *ShellState) void {
-
-        var it = self.executables.iterator();
-
-        while (it.next()) |entry| {
-
-            entry.value_ptr.deinit();
-
-        }
-
-        self.executables.deinit();
-
+    pub fn cont() Result {
+        return Result{ .cont = {} };
     }
-
-};
-
-const Command = struct {
-
-    name: []const u8,
-
-    handler: *const fn (args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void,
-
-};
-
-const echo_command = Command{
-
-    .name = "echo",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            var parsed_args = try parseQuotedArgs(state.allocator, args);
-
-            defer {
-
-                // for (parsed_args.items) |item| {
-
-                //     state.allocator.free(item);
-
-                // }
-
-                parsed_args.args.deinit();
-
-            }
-
-            // std.debug.print("Parsed arguments:\n", .{});
-
-            // for (parsed_args.items, 0..) |arg, i| {
-
-            //     std.debug.print("  arg[{d}]: '{s}'\n", .{ i, arg });
-
-            // }
-
-            //
-
-            const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
-
-            const current_stderr = try std.posix.dup(std.posix.STDERR_FILENO);
-
-            if (parsed_args.redirect_info) |redirect_info| {
-
-                // std.debug.print("redirect_info present, should redirect.\n", .{});
-
-                // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
-
-
-                //
-
-                switch (redirect_info.redirect_type) {
-
-                    .stdout => try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO),
-
-                    .stderr => try std.posix.dup2(redirect_info.fd, std.posix.STDERR_FILENO),
-
-                }
-
-            }
-
-            for (parsed_args.args.items, 0..) |arg, i| {
-
-                if (i > 0) try writer.print(" ", .{});
-
-                try writer.print("{s}", .{arg});
-
-            }
-
-            try writer.print("\n", .{});
-
-            if (parsed_args.redirect_info) |redirect_info| {
-
-                switch (redirect_info.redirect_type) {
-
-                    .stdout => try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO),
-
-                    .stderr => try std.posix.dup2(current_stderr, std.posix.STDERR_FILENO),
-
-                }
-
-            }
-
-        }
-
-    }.handler,
-
-};
-
-const CommandData = struct { args: std.ArrayList([]const u8), redirect_info: ?struct {
-
-    fd: i32,
-
-    target_file: []const u8,
-
-    redirect_type: StandardFd,
-
-} };
-
-const ArgType = union(enum) {
-
-    command_arg: []const u8,
-
-    redirect: struct {
-
-        fd: u8,
-
-        target_file: []const u8,
-
-    },
-
-};
-
-fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !CommandData {
-
-    // std.debug.print("parseQuotedArgs called. args.len: {d}\n", .{args.len});
-
-    var command_data = CommandData{ .args = std.ArrayList([]const u8).init(allocator), .redirect_info = undefined };
-
-    errdefer command_data.args.deinit();
-
-    if (args.len == 0) return command_data;
-
-    var current_arg = std.ArrayList(u8).init(allocator);
-
-    defer current_arg.deinit();
-
-    var arg_index: usize = 0;
-
-    while (arg_index < args.len) {
-
-        // Skip spaces between arguments
-
-        while (arg_index < args.len and args[arg_index] == ' ') {
-
-            // We hit a space, so if we have an argument, add it
-
-            if (current_arg.items.len > 0) {
-
-                const result_item = try allocator.dupe(u8, current_arg.items);
-
-                try command_data.args.append(result_item);
-
-                current_arg.clearRetainingCapacity();
-
-            }
-
-            arg_index += 1;
-
-        }
-
-        if (arg_index >= args.len) break;
-
-        // Process the next part of input based on what we find
-
-        if (args[arg_index] == '\'') {
-
-            // Single quotes - everything is literal
-
-            arg_index += 1;
-
-            const quote_end = std.mem.indexOf(u8, args[arg_index..], "'") orelse return error.UnterminatedQuote;
-
-            try current_arg.appendSlice(args[arg_index .. arg_index + quote_end]);
-
-            arg_index += quote_end + 1;
-
-        } else if (args[arg_index] == '"') {
-
-            // Double quotes - only process specific escapes
-
-            arg_index += 1;
-
-            while (arg_index < args.len) {
-
-                if (args[arg_index] == '"') {
-
-                    arg_index += 1;
-
-                    break;
-
-                } else if (args[arg_index] == '\\' and arg_index + 1 < args.len) {
-
-                    if (args[arg_index + 1] == '\\' or args[arg_index + 1] == '"') {
-
-                        try current_arg.append(args[arg_index + 1]);
-
-                        arg_index += 2;
-
-                    } else {
-
-                        try current_arg.append('\\');
-
-                        arg_index += 1;
-
-                    }
-
-                } else {
-
-                    try current_arg.append(args[arg_index]);
-
-                    arg_index += 1;
-
-                }
-
-            }
-
-        } else {
-
-            // Unquoted - process until space or quote
-
-            while (arg_index < args.len) {
-
-                // std.debug.print("checking if redirect\n", .{});
-
-                // std.debug.print("arg_index: {d}\n", .{arg_index});
-
-
-                const redir_info = is_redirect(args, &arg_index);
-
-                if (redir_info.should_redirect) {
-
-                    // std.debug.print("redirect detected\n", .{});
-
-                    // std.debug.print("arg_index: {d}\n", .{arg_index});
-
-                    var redirect_destination = std.ArrayList(u8).init(allocator);
-
-                    // Need to eat the next space to get to the redirect target
-
-                    arg_index += 1;
-
-                    // We don't want to crash here but we should report the error.
-
-                    if (arg_index >= args.len) break;
-
-                    while (arg_index < args.len) {
-
-                        // std.debug.print("in redirect parsing loop. arg_index: {d}\n", .{arg_index});
-
-                        if (args[arg_index] == ' ') {
-
-                            break;
-
-                        }
-
-                        // std.debug.print("appending to redirect_destination from: {d}\n", .{arg_index});
-
-                        // std.debug.print("args[{d}] = {c}\n", .{ arg_index, args[arg_index] });
-
-                        try redirect_destination.append(args[arg_index]);
-
-                        arg_index += 1;
-
-                    }
-
-                    // std.debug.print("end of redirect detected at: {d}\n", .{arg_index});
-
-                    arg_index += 1;
-
-                    const redirect_item = try allocator.dupe(u8, redirect_destination.items);
-
-                    const file = try std.fs.cwd().createFile(redirect_item, .{ .read = true });
-
-                    // std.debug.print("fd: {d}\n", .{file.handle});
-
-
-                    command_data.redirect_info = .{ .fd = file.handle, .redirect_type = redir_info.redirect_type.?, .target_file = redirect_item };
-
-                    break;
-
-                }
-
-                if (arg_index >= args.len) break;
-
-                if (args[arg_index] == ' ') break;
-
-                if (args[arg_index] == '\\' and arg_index + 1 < args.len) {
-
-                    arg_index += 1;
-
-                    try current_arg.append(args[arg_index]);
-
-                } else {
-
-                    try current_arg.append(args[arg_index]);
-
-                }
-
-                arg_index += 1;
-
-            }
-
-        }
-
+    pub fn exit(code: u8) Result {
+        return Result{ .exit = code };
     }
-
-    // Don't forget to add the last argument if we have one
-
-    if (current_arg.items.len > 0) {
-
-        const result_item = try allocator.dupe(u8, current_arg.items);
-
-        try command_data.args.append(result_item);
-
-    }
-
-    return command_data;
-
-}
-
-const StandardFd = enum { stdout, stderr };
-
-const RedirectInfo = struct { should_redirect: bool, redirect_type: ?StandardFd };
-
-fn is_redirect(args: []const u8, index: *usize) RedirectInfo {
-
-    if (args.len <= index.* + 1) {
-
-
-        return RedirectInfo{ .should_redirect = false, .redirect_type = undefined };
-
-    }
-
-    if (args[index.*] == '1' and args[index.* + 1] == '>') {
-
-        index.* = index.* + 2;
-
-
-        return RedirectInfo{ .should_redirect = true, .redirect_type = .stdout };
-
-    }
-
-    if (args[index.*] == '2' and args[index.* + 1] == '>') {
-
-        index.* = index.* + 2;
-
-        return RedirectInfo{ .should_redirect = true, .redirect_type = .stderr };
-
-    }
-
-    if (args[index.*] == '>') {
-
-        index.* = index.* + 1;
-
-        return RedirectInfo{ .should_redirect = true, .redirect_type = .stdout };
-
-    }
-
-    return RedirectInfo{ .should_redirect = false, .redirect_type = undefined };
-
-}
-
-const pwd_command = Command{
-
-    .name = "pwd",
-
-    .handler = struct {
-
-        fn handler(_: []const u8, writer: std.fs.File.Writer, _: *ShellState) anyerror!void {
-
-            var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-
-            _ = try std.posix.getcwd(&buf);
-
-            try writer.print("{s}\n", .{buf});
-
-        }
-
-    }.handler,
-
 };
-
-const exit_command = Command{
-
-    .name = "exit",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, _: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            state.should_exit = true;
-
-            state.exit_code = if (args.len > 0)
-
-                try std.fmt.parseInt(u8, args, 10)
-
-            else
-
-                0;
-
-        }
-
-    }.handler,
-
-};
-
-const type_command = Command{
-
-    .name = "type",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            if (commands.has(args)) {
-
-                try writer.print("{s} is a shell builtin\n", .{args});
-
-            } else {
-
-                var new_iter = std.mem.splitScalar(u8, state.env_path, ':');
-
-                while (new_iter.next()) |path| {
-
-                    if (try commandInDir(state.allocator, path, args)) |exe| {
-
-                        try writer.print("{s} is {s}/{s}\n", .{ args, exe.path, args });
-
-                        exe.deinit();
-
-                        return;
-
-                    }
-
-                }
-
-                try writer.print("{s}: not found\n", .{args});
-
-            }
-
-        }
-
-    }.handler,
-
-};
-
-const cd_command = Command{
-
-    .name = "cd",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, _: *ShellState) anyerror!void {
-
-            var new_dir = args;
-
-            if (args.len == 0 or std.mem.eql(u8, args, "~")) {
-
-                const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
-
-                new_dir = home;
-
-            } else if (!std.mem.startsWith(u8, args, "/")) {
-
-                var cwdBuf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-
-                const cwd = try std.posix.getcwd(&cwdBuf);
-
-                if (std.mem.eql(u8, args, "./")) {
-
-                    new_dir = cwd;
-
-                } else if (std.mem.eql(u8, args, "../")) {
-
-                    const last_slash = std.mem.lastIndexOf(u8, cwd, "/").?;
-
-                    new_dir = cwd[0..last_slash];
-
-                }
-
-            }
-
-            std.posix.chdir(new_dir) catch |err| switch (err) {
-
-                error.FileNotFound => {
-
-                    try writer.print("cd: {s}: No such file or directory\n", .{args});
-
-                },
-
-                else => return err,
-
-            };
-
-        }
-
-    }.handler,
-
-};
-
-const commands_array = [_]Command{
-
-    echo_command,
-
-    exit_command,
-
-    type_command,
-
-    pwd_command,
-
-    cd_command,
-
-};
-
-const commands = blk: {
-
-    var commands_map_entries: [commands_array.len]struct { []const u8, Command } = undefined;
-
-    for (commands_array, 0..) |cmd, i| {
-
-        commands_map_entries[i] = .{ cmd.name, cmd };
-
-    }
-
-    break :blk std.StaticStringMap(Command).initComptime(commands_map_entries);
-
-};
-
-pub fn main() !u8 {
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
-    const allocator = gpa.allocator();
-
-    defer _ = gpa.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-
-    defer arena.deinit();
-
-    const arena_allocator = arena.allocator();
-
-    const stdout = std.io.getStdOut().writer();
-
-    var shell_state = ShellState.init(arena_allocator);
-
-    defer shell_state.deinit();
-
-    var env_vars = try std.process.getEnvMap(allocator);
-
-    defer env_vars.deinit();
-
-    const env_path = env_vars.get("PATH") orelse return error.PathNotSet;
-
-    shell_state.env_path = env_path;
-
-    // try stdout.print("Welcome to the meh interactive shell\n", .{});
-
-    // try stdout.print("May your computing be prosperous\n", .{});
-
-    // try stdout.print("------------------------------------\n", .{});
-
-    while (true) {
-
-        try stdout.print("$ ", .{});
-
-        const stdin = std.io.getStdIn().reader();
-
-        var buffer: [1024]u8 = undefined;
-
-        const user_input = stdin.readUntilDelimiter(&buffer, '\n') catch |err| switch (err) {
-
-            error.EndOfStream => break,
-
-            else => return err,
-
-        };
-
-        const ParsingState = enum { normal, in_single_quote, in_double_quote };
-
-        var i: usize = 0;
-
-        var command_buffer = std.ArrayList(u8).init(allocator);
-
-        defer command_buffer.deinit();
-
-        var parsing_state = ParsingState.normal;
-
-        for (user_input) |c| {
-
-            switch (c) {
-
-                ' ' => {
-
-                    if (parsing_state == ParsingState.normal) {
-
-                        break;
-
-                    } else {
-
-                        try command_buffer.append(c);
-
-                    }
-
-                },
-
-                '"' => {
-
-                    switch (parsing_state) {
-
-                        ParsingState.in_double_quote => parsing_state = ParsingState.normal,
-
-                        ParsingState.normal => parsing_state = ParsingState.in_double_quote,
-
-                        else => try command_buffer.append(c),
-
-                    }
-
-                },
-
-                '\'' => {
-
-                    switch (parsing_state) {
-
-                        ParsingState.in_single_quote => parsing_state = ParsingState.normal,
-
-                        ParsingState.normal => parsing_state = ParsingState.in_single_quote,
-
-                        else => try command_buffer.append(c),
-
-                    }
-
-                },
-
-                else => try command_buffer.append(c),
-
-            }
-
-            i += 1;
-
-        }
-
-        const command = command_buffer.items;
-
-        var args: []u8 = "";
-
-        if (i < user_input.len) {
-
-            args = user_input[i + 1 ..];
-
-        }
-
-        //         var inputs = std.mem.splitAny(u8, user_input, " ");
-
-        //         const command = inputs.first();
-
-        //         const args = inputs.rest();
-
-        //
-
-        // std.debug.print("command: {s}\n", .{command});
-
-        // std.debug.print("args: {s}\n", .{args});
-
-        if (commands.get(command)) |cmd| {
-
-            try cmd.handler(args, stdout, &shell_state);
-
-        } else {
-
-            var is_complete = false;
-
-            var new_iter = std.mem.splitScalar(u8, shell_state.env_path, ':');
-
-            while (new_iter.next()) |path| {
-
-                if (try commandInDir(shell_state.allocator, path, command)) |exe| {
-
-                    is_complete = true;
-
-                    const full_path = try std.fs.path.join(allocator, &.{ exe.path, exe.name });
-
-                    defer allocator.free(full_path);
-
-                    var argv = std.ArrayList([]const u8).init(allocator);
-
-                    defer argv.deinit();
-
-                    try argv.append(full_path);
-
-                    var parsed_args = try parseQuotedArgs(shell_state.allocator, args);
-
-                    defer {
-
-                        // Clean up all our allocations when we're done
-
-                        // for (parsed_args.items) |item| {
-
-                        //     shell_state.allocator.free(item);
-
-                        // }
-
-                        parsed_args.args.deinit();
-
-                    }
-
-                    for (parsed_args.args.items) |arg| {
-
-                        try argv.append(arg);
-
-                    }
-
-                    // if (parsed_args.redirect_info) |_| {
-
-                    //     std.debug.print("redirect_info present, should redirect.\n", .{});
-
-                    // }
-
-                    // Before executing the command:
-
-                    // std.debug.print("Arguments for {s}:\n", .{command});
-
-                    // for (argv.items, 0..) |arg, i| {
-
-                    //     std.debug.print("  arg[{d}]: '{s}'\n", .{ i, arg });
-
-                    // }
-
-                    //
-
-                    //
-
-                    const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
-
-                    const current_stderr = try std.posix.dup(std.posix.STDERR_FILENO);
-
-                    if (parsed_args.redirect_info) |redirect_info| {
-
-                        // std.debug.print("redirect_info present, should redirect.\n", .{});
-
-                        // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
-
-                        switch (redirect_info.redirect_type) {
-
-                            .stdout => try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO),
-
-                            .stderr => try std.posix.dup2(redirect_info.fd, std.posix.STDERR_FILENO),
-
-                        }
-
-                    }
-
-                    var child = std.process.Child.init(argv.items, allocator);
-
-                    _ = try child.spawnAndWait();
-
-
-                    if (parsed_args.redirect_info) |redirect_info| {
-
-                        switch (redirect_info.redirect_type) {
-
-                            .stdout => try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO),
-
-                            .stderr => try std.posix.dup2(current_stderr, std.posix.STDERR_FILENO),
-
-                        }
-
-                    }
-
-                    defer exe.deinit();
-
-                    break;
-
-                }
-
-            }
-
-            if (!is_complete) {
-
-                try stdout.print("{s}: command not found\n", .{user_input});
-
-            }
-
-        }
-
-        if (shell_state.should_exit) {
-
-            return shell_state.exit_code;
-
-        }
-
-    }
-
-    try stdout.print("Exiting shell... Thanks for playing.\n", .{});
-
-    return 1;
-
-}
-
-const Executable = struct {
-
-    name: []const u8,
-
-    path: []const u8,
-
+const Context = struct {
     allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *const Executable) void {
-
-        self.allocator.free(self.name);
-
-        self.allocator.free(self.path);
-
-    }
-
+    env_map: std.process.EnvMap,
+    out: std.io.BufferedWriter(4096, std.fs.File.Writer).Writer,
+    err: std.io.BufferedWriter(4096, std.fs.File.Writer).Writer,
 };
 
-fn commandInDir(allocator: std.mem.Allocator, path: []const u8, command: []const u8) !?Executable {
+const BuiltinSymbolKind = enum { exit, echo, type, pwd, cd };
+const BuiltinSymbol = struct { name: []const u8, kind: BuiltinSymbolKind };
+const FileSymbol = struct { name: []const u8, path: []const u8 };
+const UnknownSymbol = struct { name: []const u8 };
+const SymbolType = enum { builtin, file, unknown };
+const Symbol = union(SymbolType) {
+    builtin: BuiltinSymbol,
+    file: FileSymbol,
+    unknown: UnknownSymbol,
+};
 
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
+fn nextInput(allocator: std.mem.Allocator, reader: anytype, buffer: []u8) !Input {
+    const line = reader.readUntilDelimiterOrEof(buffer, '\n') catch {
+        return Input.empty();
+    } orelse return Input.empty();
 
-        error.FileNotFound => return null,
+    const trimmed_line = if (Pal.trim_cr)
+        mem.trimRight(u8, line, "\r")
+    else
+        line;
 
-        else => return null,
+    var token_iter = util.tokenize(allocator, trimmed_line);
+    var input = std.ArrayList([]const u8).init(allocator);
+    var out_target = Target{ .stdout = {} };
+    var err_target = Target{ .stderr = {} };
+    defer input.deinit();
 
+    while (try token_iter.next()) |token| {
+        if (mem.eql(u8, token, ">") or mem.eql(u8, token, "1>")) {
+            if (try token_iter.next()) |file| {
+                out_target = try Target.fileTruncate(file);
+            }
+            break;
+        }
+
+        if (mem.eql(u8, token, ">>") or mem.eql(u8, token, "1>>")) {
+            if (try token_iter.next()) |file| {
+                out_target = try Target.fileAppend(file);
+            }
+            break;
+        }
+
+        if (mem.eql(u8, token, "2>")) {
+            if (try token_iter.next()) |file| {
+                err_target = try Target.fileTruncate(file);
+            }
+            break;
+        }
+
+        if (mem.eql(u8, token, "2>>")) {
+            if (try token_iter.next()) |file| {
+                err_target = try Target.fileAppend(file);
+            }
+            break;
+        }
+
+        try input.append(token);
+    }
+
+    return Input{
+        .tokens = try input.toOwnedSlice(),
+        .out_target = out_target,
+        .err_target = err_target,
     };
+}
 
-    defer dir.close();
+fn resolveBuiltinSymbol(symbol_name: []const u8) ?BuiltinSymbol {
+    if (mem.eql(u8, symbol_name, "exit")) {
+        return BuiltinSymbol{ .name = symbol_name, .kind = .exit };
+    } else if (mem.eql(u8, symbol_name, "echo")) {
+        return BuiltinSymbol{ .name = symbol_name, .kind = .echo };
+    } else if (mem.eql(u8, symbol_name, "type")) {
+        return BuiltinSymbol{ .name = symbol_name, .kind = .type };
+    } else if (mem.eql(u8, symbol_name, "pwd")) {
+        return BuiltinSymbol{ .name = symbol_name, .kind = .pwd };
+    } else if (mem.eql(u8, symbol_name, "cd")) {
+        return BuiltinSymbol{ .name = symbol_name, .kind = .cd };
+    } else {
+        return null;
+    }
+}
 
-    var iter = dir.iterate();
+fn resolveFileSymbol(ctx: Context, symbol_name: []const u8) ?FileSymbol {
+    const path = ctx.env_map.get("PATH") orelse "";
+    const cwd = std.fs.cwd();
 
-    while (try iter.next()) |entry| {
+    var search_dirs = std.mem.split(u8, path, Pal.path_separator);
+    while (search_dirs.next()) |dir_path| {
+        const dir = cwd.openDir(dir_path, .{ .iterate = true }) catch continue;
 
-        const name = try allocator.dupe(u8, entry.name);
+        var files = dir.iterate();
+        while (files.next() catch null) |entry| {
+            if (@as(?std.fs.Dir.Entry, entry)) |file| {
+                if (mem.eql(u8, file.name, symbol_name)) {
+                    const program_path = util.join_path(ctx.allocator, dir_path, symbol_name);
 
-        errdefer allocator.free(name);
-
-        if (std.mem.eql(u8, name, command)) {
-
-            return Executable{ .name = name, .path = try allocator.dupe(u8, path), .allocator = allocator };
-
+                    return FileSymbol{ .name = symbol_name, .path = program_path };
+                }
+            }
         }
-
-        // If we didn't find a match, free the name we allocated
-
-        allocator.free(name);
-
     }
 
     return null;
-
 }
 
-fn processPathDir(allocator: std.mem.Allocator, path: []const u8, state: *ShellState) !void {
-
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
-
-        error.FileNotFound => {
-
-            // std.debug.print("Directory not found: {s}\n", .{path});
-
-            return;
-
-        },
-
-        else => {
-
-            // std.debug.print("Error opening directory {s}: {any}\n", .{ path, err });
-
-            return;
-
-        },
-
-    };
-
-    defer dir.close();
-
-    // Iterate over all entries
-
-    var iter = dir.iterate();
-
-    while (try iter.next()) |entry| {
-
-        // if (entry.kind == .file or entry.kind == .sym_link) {
-
-        // const file_stat = try dir.statFile(entry.name);
-
-        // const is_executable = (file_stat.mode & std.os.linux.S.IXUSR) != 0 or
-
-        //     (file_stat.mode & std.os.linux.S.IXGRP) != 0 or
-
-        //     (file_stat.mode & std.os.linux.S.IXOTH) != 0;
-
-        // if (is_executable) {
-
-        const name = try allocator.dupe(u8, entry.name);
-
-        errdefer allocator.free(name);
-
-        if (!state.executables.contains(name)) {
-
-            try state.executables.put(name, .{
-
-                .name = name,
-
-                .path = try allocator.dupe(u8, path),
-
-                .allocator = allocator,
-
-            });
-
-        } else {
-
-            allocator.free(name);
-
-        }
-
-        // }
-
-        // }
-
+fn resolveSymbol(ctx: Context, symbol_name: []const u8) Symbol {
+    if (resolveBuiltinSymbol(symbol_name)) |builtin| {
+        return Symbol{ .builtin = builtin };
     }
 
+    if (resolveFileSymbol(ctx, symbol_name)) |file| {
+        return Symbol{ .file = file };
+    }
+
+    return Symbol{ .unknown = UnknownSymbol{ .name = symbol_name } };
+}
+
+fn handleExitCommand(args: []const []const u8) !Result {
+    const code = try std.fmt.parseInt(u8, args[0], 10);
+
+    return Result.exit(code);
+}
+
+fn handleEchoCommand(ctx: Context, args: []const []const u8) !Result {
+    var first = true;
+
+    for (args) |arg| {
+        if (!first) try ctx.out.print(" ", .{});
+        first = false;
+
+        try ctx.out.print("{s}", .{arg});
+    }
+
+    try ctx.out.writeAll("\n");
+    return Result.cont();
+}
+
+fn handleTypeCommand(ctx: Context, args: []const []const u8) !Result {
+    const arg = args[0];
+    const symbol = resolveSymbol(ctx, arg);
+
+    const builtin = "{s} is a shell builtin";
+    const is_program = "{s} is {s}";
+    const not_found = "{s}: not found";
+    switch (symbol) {
+        .builtin => |builtin_symbol| try ctx.out.print(builtin, .{builtin_symbol.name}),
+        .file => |file_symbol| try ctx.out.print(is_program, .{ file_symbol.name, file_symbol.path }),
+        .unknown => try ctx.out.print(not_found, .{arg}),
+    }
+
+    try ctx.out.writeAll("\n");
+    return Result.cont();
+}
+
+fn handlePwdCommand(ctx: Context) !Result {
+    const cwd = try std.fs.cwd().realpathAlloc(ctx.allocator, ".");
+
+    try ctx.out.print("{s}\n", .{cwd});
+
+    return Result.cont();
+}
+
+fn handleCdCommand(ctx: Context, args: []const []const u8) !?Result {
+    const arg = args[0];
+    const dir_path = if (mem.eql(u8, arg, "~"))
+        ctx.env_map.get("HOME") orelse ""
+    else
+        arg;
+
+    const dir = std.fs.cwd().openDir(dir_path, .{}) catch {
+        try ctx.out.print("cd: {s}: No such file or directory\n", .{arg});
+        return Result.cont();
+    };
+
+    try dir.setAsCwd();
+    return Result.cont();
+}
+
+fn tryHandleBuiltin(ctx: Context, input: []const []const u8) !?Result {
+    if (input.len < 1) {
+        return null;
+    }
+
+    if (resolveBuiltinSymbol(input[0])) |builtin| {
+        const args = input[1..];
+
+        return switch (builtin.kind) {
+            .exit => try handleExitCommand(args),
+            .echo => try handleEchoCommand(ctx, args),
+            .type => try handleTypeCommand(ctx, args),
+            .pwd => try handlePwdCommand(ctx),
+            .cd => try handleCdCommand(ctx, args),
+        };
+    } else {
+        return null;
+    }
+}
+
+fn tryHandleRunProcess(ctx: Context, input: []const []const u8) !?Result {
+    if (input.len < 1) {
+        return null;
+    }
+
+    if (resolveFileSymbol(ctx, input[0])) |file| {
+        var argv = std.ArrayList([]const u8).init(ctx.allocator);
+        defer argv.deinit();
+
+        try argv.append(file.path);
+        try argv.appendSlice(input[1..]);
+
+        var proc = std.process.Child.init(argv.items, ctx.allocator);
+        proc.stdout_behavior = .Pipe;
+        proc.stderr_behavior = .Pipe;
+
+        try proc.spawn();
+        try util.forward(proc.stderr.?, ctx.err);
+        try util.forward(proc.stdout.?, ctx.out);
+        _ = try proc.wait();
+
+        return Result.cont();
+    } else {
+        return null;
+    }
+}
+
+fn handleUnknown(ctx: Context, input: []const []const u8) !Result {
+    const cmd = if (input.len > 0) input[0] else "";
+
+    try ctx.out.print("{s}: command not found\n", .{cmd});
+    return Result.cont();
+}
+
+fn handleInput(ctx: Context, input: []const []const u8) !Result {
+    if (try tryHandleBuiltin(ctx, input)) |result| {
+        return result;
+    } else if (try tryHandleRunProcess(ctx, input)) |result| {
+        return result;
+    } else {
+        return try handleUnknown(ctx, input);
+    }
+}
+
+fn createWriter(target: Target) std.io.BufferedWriter(4096, std.fs.File.Writer) {
+    return switch (target) {
+        .stdout => std.io.bufferedWriter(std.io.getStdOut().writer()),
+        .stderr => std.io.bufferedWriter(std.io.getStdErr().writer()),
+        .file => |file| std.io.bufferedWriter(file.writer()),
+    };
+}
+
+pub fn main() !u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stdin = std.io.getStdIn().reader();
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const deinit_status = gpa.deinit();
+        //fail test; can't try in defer as defer is executed after we return
+        if (deinit_status == .leak) std.testing.expect(false) catch @panic("TEST FAIL");
+    }
+
+    var env_map = try std.process.getEnvMap(gpa.allocator());
+    defer env_map.deinit();
+
+    var buffer: [4096]u8 = undefined;
+
+    while (true) {
+        try stdout.writeAll("$ ");
+
+        var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+        defer arena.deinit();
+
+        @memset(&buffer, 0);
+        var input = try nextInput(arena.allocator(), stdin, &buffer);
+        defer input.deinit();
+
+        var out = createWriter(input.out_target);
+        var err = createWriter(input.err_target);
+
+        const ctx = Context{
+            .allocator = arena.allocator(),
+            .env_map = env_map,
+            .out = out.writer(),
+            .err = err.writer(),
+        };
+
+        const result = try handleInput(ctx, input.tokens);
+        try out.flush();
+        try err.flush();
+
+        switch (result) {
+            .cont => {},
+            .exit => |code| return code,
+        }
+    }
 }
