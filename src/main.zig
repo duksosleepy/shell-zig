@@ -1,193 +1,429 @@
 const std = @import("std");
 
-pub fn main() !void {
+const mem = std.mem;
 
-    const stdout = std.io.getStdOut().writer();
+const ArrayList = std.ArrayList;
 
-    const stdin = std.io.getStdIn().reader();
+const CommandFn = *const fn ([]const u8, std.fs.File.Writer) anyerror!void;
 
-    while (true) {
+const Command = struct {
 
-        try stdout.print("$ ", .{});
+    name: []const u8,
 
-        var buffer: [1024]u8 = undefined;
+    handler: CommandFn,
 
-        const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
+};
 
-        var it = std.mem.split(u8, user_input, " ");
+fn check_known_command(command: []const u8) ?*const Command {
 
-        const command = it.next().?;
+    for (&commands) |*cmd| {
 
-        if (std.mem.eql(u8, command, "exit")) {
+        if (mem.eql(u8, cmd.name, command)) return cmd;
 
-            _ = it.next().?;
+    }
 
-            std.process.exit(0);
+    return null;
 
-        } else if (std.mem.eql(u8, command, "echo")) {
+}
 
-            const arg = it.next().?;
+fn echo_handler(args: []const u8, stdout: std.fs.File.Writer) !void {
 
-            try stdout.print("{s}", .{arg});
+    try stdout.print("{s}\n", .{args});
 
-            while (it.next()) |a| {
+}
 
-                try stdout.print(" {s}", .{a});
+fn exit_handler(args: []const u8, stdout: std.fs.File.Writer) !void {
 
-            }
+    _ = stdout;
 
-            try stdout.print("\n", .{});
+    const exit_code: u8 = if (args.len > 0) std.fmt.parseInt(u8, args, 10) catch 0 else 0;
 
-        } else if (std.mem.eql(u8, command, "type")) {
+    std.process.exit(exit_code);
 
-            const arg = it.next().?;
+}
 
-            if (std.mem.eql(u8, arg, "echo")) {
+const CommandLocation = struct {
 
-                try stdout.print("echo is a shell builtin\n", .{});
+    found: bool,
 
-            } else if (std.mem.eql(u8, arg, "exit")) {
+    path: ?[]const u8,
 
-                try stdout.print("exit is a shell builtin\n", .{});
+};
 
-            } else if (std.mem.eql(u8, arg, "type")) {
+// User must deinit the returned arraylist
 
-                try stdout.print("type is a shell builtin\n", .{});
+fn get_env_path(allocator: std.mem.Allocator) !ArrayList([]const u8) {
 
-            } else if (std.mem.eql(u8, arg, "pwd")) {
+    var locations = ArrayList([]const u8).init(allocator);
 
-                try stdout.print("pwd is a shell builtin\n", .{});
+    var env = try std.process.getEnvMap(allocator);
 
-            } else if (std.mem.eql(u8, arg, "cd")) {
+    defer env.deinit();
 
-                try stdout.print("cd is a shell builtin\n", .{});
+    if (env.get("PATH")) |path_env| {
 
-            } else {
+        var it = mem.tokenizeScalar(u8, path_env, ':');
 
-                const command_path = find_in_path(arg) catch {
+        while (it.next()) |path| {
 
-                    try stdout.print("{s}: not found\n", .{arg});
+            const owned_path = try allocator.dupe(u8, path);
 
-                    continue;
-
-                };
-
-                try stdout.print("{s} is {s}\n", .{ arg, command_path });
-
-            }
-
-        } else if (std.mem.eql(u8, command, "pwd")) {
-
-            var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-
-            const cwd = try std.process.getCwd(&buf);
-
-            try stdout.print("{s}\n", .{cwd});
-
-        } else if (std.mem.eql(u8, command, "cd")) {
-
-            const arg = it.next().?;
-
-            // try std.process.chdir(arg);
-
-            var dir = std.fs.cwd().openDir(arg, .{}) catch {
-
-                try stdout.print("cd: {s}: No such file or directory\n", .{arg});
-
-                continue;
-
-            };
-
-            defer dir.close();
-
-            try dir.setAsCwd();
-
-        } else {
-
-            _ = find_in_path(command) catch {
-
-                try stdout.print("{s}: command not found\n", .{command});
-
-                continue;
-
-            };
-
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-
-            defer arena.deinit();
-
-            const allocator = arena.allocator();
-
-            var arg_list = std.ArrayList([]const u8).init(allocator);
-
-            defer arg_list.deinit();
-
-            try arg_list.append(command);
-
-            while (it.next()) |arg| {
-
-                try arg_list.append(arg);
-
-            }
-
-            var childArena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-
-            defer childArena.deinit();
-
-            const childAllocator = childArena.allocator();
-
-            var child = std.process.Child.init(arg_list.items, childAllocator);
-
-            try child.spawn();
-
-            _ = try child.wait();
+            try locations.append(owned_path);
 
         }
+
+    }
+
+    return locations;
+
+}
+
+// could return an optional error of potential issues along with bool
+
+fn command_in_path(command_name: []const u8) !CommandLocation {
+
+    // Validate input
+
+    if (command_name.len == 0) return error.EmptyCommandName;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+    const allocator = gpa.allocator();
+
+    const env_path = get_env_path(allocator) catch |err| {
+
+        std.debug.print("Failed to get PATH: {}\n", .{err});
+
+        return error.EnvPathError;
+
+    };
+
+    defer env_path.deinit();
+
+    for (env_path.items) |path| {
+
+        // skip relative paths
+
+        if (!std.fs.path.isAbsolute(path)) continue;
+
+        if (!std.fs.path.isAbsolute(path)) {
+
+            std.debug.print("> [warning] skipping relative path: {s}\n", .{path});
+
+            continue;
+
+        }
+
+        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| {
+
+            if (err == error.FileNotFound) continue;
+
+            std.debug.print("> [error] cannot open directory={s}, err={}\n", .{ path, err });
+
+            continue;
+
+        };
+
+        defer dir.close();
+
+        var walker = try dir.walk(allocator);
+
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+
+            if (mem.eql(u8, entry.basename, command_name)) return CommandLocation{ .path = path, .found = true };
+
+        }
+
+    }
+
+    return CommandLocation{ .path = null, .found = false };
+
+}
+
+fn type_handler(args: []const u8, stdout: std.fs.File.Writer) !void {
+
+    var it = mem.tokenizeScalar(u8, args, ' ');
+
+    // Change to a while loop to check for every arg
+
+    if (it.next()) |arg| {
+
+        for (commands) |builtin_cmd| {
+
+            if (mem.eql(u8, arg, builtin_cmd.name)) {
+
+                try stdout.print("{s} is a shell builtin\n", .{arg});
+
+                return;
+
+            }
+
+        }
+
+        const result = try command_in_path(arg);
+
+        if (result.found) {
+
+            try stdout.print("{s} is {?s}/{s}\n", .{ arg, result.path, arg });
+
+            return;
+
+        }
+
+        try stdout.print("{s}: not found\n", .{arg});
 
     }
 
 }
 
-fn find_in_path(command: []const u8) ![]const u8 {
+fn pwd_handler(args: []const u8, stdout: std.fs.File.Writer) !void {
 
-    const allocator = std.heap.page_allocator;
+    _ = args;
 
-    const memory = try allocator.alloc(u8, 100);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
 
-    defer allocator.free(memory);
+    const path = std.fs.cwd().realpath(".", &buffer);
 
-    const env = try std.process.getEnvMap(allocator);
+    // obv no errors are checked here
 
-    const path = std.process.EnvMap.get(env, "PATH").?;
+    try stdout.print("{!s}\n", .{path});
 
-    var dirs = std.mem.split(u8, path, ":");
+}
 
-    while (dirs.next()) |dir| {
+fn cd_handler(args: []const u8, stdout: std.fs.File.Writer) !void {
 
-        var files = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+    // idc about best practices mem bullshit fk u future me :D
 
-        defer files.close();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
-        var fs_iter = files.iterate();
+    const allocator = gpa.allocator();
 
-        while (try fs_iter.next()) |f| {
+    var first_path_arg = mem.tokenizeScalar(u8, args, ' ');
 
-            if (std.mem.eql(u8, f.name, command)) {
+    if (first_path_arg.next()) |new_path| {
 
-                const memory2 = try allocator.alloc(u8, 100);
+        var stack = std.ArrayList([]const u8).init(allocator);
 
-                defer allocator.free(memory2);
+        var is_relative_path: bool = false;
 
-                const joined = try std.fs.path.join(allocator, &[_][]const u8{ dir, f.name });
+        if (new_path[0] != std.fs.path.sep) is_relative_path = true;
 
-                return joined;
+        if (is_relative_path) {
+
+            // Will add the current path to the stack as context
+
+            const cur_path = try std.fs.cwd().realpathAlloc(allocator, ".");
+
+            var cur_it = mem.tokenizeScalar(u8, cur_path, std.fs.path.sep);
+
+            // load the current path seperated into stack
+
+            while (cur_it.next()) |cur| {
+
+                try stack.append(cur);
+
+            }
+
+        }
+
+        // worst name in the world
+
+        var paths_it = mem.tokenizeScalar(u8, new_path, std.fs.path.sep);
+
+        while (paths_it.next()) |loc| {
+
+            if (mem.eql(u8, loc, ".")) continue;
+
+            if (mem.eql(u8, loc, "..")) {
+
+                _ = stack.pop();
+
+                continue;
+
+            }
+
+            try stack.append(loc);
+
+        }
+
+        // rejoins paths into single string, always includes sep at beg which isn't ideal
+
+        const resulting_path = try mem.join(allocator, std.fs.path.sep_str, stack.items);
+
+        const res_with_sep = try std.fmt.allocPrint(allocator, "{s}{s}", .{ std.fs.path.sep_str, resulting_path });
+
+        std.posix.chdir(res_with_sep) catch |err| switch (err) {
+
+            error.AccessDenied => {
+
+                try stdout.print("Access Denied to directory\n", .{});
+
+            },
+
+            error.FileSystem => {
+
+                try stdout.print("File system error\n", .{});
+
+            },
+
+            error.SymLinkLoop => {
+
+                try stdout.print("A symlink loop occured\n", .{});
+
+            },
+
+            error.NameTooLong => {
+
+                try stdout.print("The name was too lone\n", .{});
+
+            },
+
+            error.FileNotFound => {
+
+                try stdout.print("cd: {s}: No such file or directory\n", .{res_with_sep});
+
+            },
+
+            error.NotDir => {
+
+                try stdout.print("Path was not a directory\n", .{});
+
+            },
+
+            error.BadPathName => {
+
+                try stdout.print("Bad Path Name\n", .{});
+
+            },
+
+            else => {
+
+                try stdout.print("An error occured\n", .{});
+
+            },
+
+        };
+
+    }
+
+}
+
+fn execute_command(command: []const u8, args: []const u8, allocator: mem.Allocator) !void {
+
+    // needs to consider path too?
+
+    if (args.len == 0) {
+
+        var child = std.process.Child.init(&[_][]const u8{command}, allocator);
+
+        _ = try child.spawnAndWait();
+
+        return;
+
+    }
+
+    var child = std.process.Child.init(&[_][]const u8{ command, args }, allocator);
+
+    _ = try child.spawnAndWait();
+
+}
+
+const commands = [_]Command{
+
+    .{ .name = "echo", .handler = echo_handler },
+
+    .{ .name = "exit", .handler = exit_handler },
+
+    .{ .name = "type", .handler = type_handler },
+
+    .{ .name = "pwd", .handler = pwd_handler },
+
+    .{ .name = "cd", .handler = cd_handler },
+
+};
+
+pub fn main() !void {
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+    const allocator = gpa.allocator();
+
+    const stdout = std.io.getStdOut().writer();
+
+    const stdin = std.io.getStdIn().reader();
+
+    var buffer: [1024]u8 = undefined;
+
+    repl: while (true) {
+
+        try stdout.print("$ ", .{});
+
+        const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
+
+        var it = mem.tokenizeScalar(u8, user_input, ' ');
+
+        if (it.next()) |command| {
+
+            if (check_known_command(command)) |known_cmd| {
+
+                var args_buffer: [1024]u8 = undefined;
+
+                var args_len: usize = 0;
+
+                // loop to ``
+
+                while (it.next()) |arg| {
+
+                    if (args_len > 0) {
+
+                        args_buffer[args_len] = ' ';
+
+                        args_len += 1;
+
+                    }
+
+                    @memcpy(args_buffer[args_len..][0..arg.len], arg);
+
+                    args_len += arg.len;
+
+                }
+
+                const args = args_buffer[0..args_len];
+
+                try known_cmd.handler(args, stdout);
+
+                continue :repl;
+
+            } else {
+
+                const command_loc = try command_in_path(command);
+
+                // check if found then path, this is nasty
+
+                if (command_loc.found) {
+
+                    if (command_loc.path) |path| {
+
+                        _ = path;
+
+                        // RUN THE BINARY HERE!!!!!
+
+                        try execute_command(command, it.rest(), allocator);
+
+                    }
+
+                } else {
+
+                    try stdout.print("{s}: command not found\n", .{command});
+
+                }
 
             }
 
         }
 
     }
-
-    return error.Oops;
 
 }
