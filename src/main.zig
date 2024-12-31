@@ -1,22 +1,20 @@
 const std = @import("std");
 
-fn find_on_path(alloc: std.mem.Allocator, name: []const u8) !?[]const u8 {
+fn findBinPath(allocator: std.mem.Allocator, path: ?[]const u8, name: []const u8) !?[]const u8 {
 
-    const path = std.posix.getenv("PATH") orelse "";
+    if (path) |p| {
 
-    var iter = std.mem.tokenizeScalar(u8, path, ':');
+        var it = std.mem.tokenizeScalar(u8, p, ':');
 
-    while (iter.next()) |dirname| {
+        while (it.next()) |entry| {
 
-        const joined = try std.fs.path.join(alloc, &[_][]const u8{ dirname, name });
+            const bin = try std.fs.path.join(allocator, &.{ entry, name });
 
-        if (std.fs.cwd().access(joined, std.fs.File.OpenFlags{})) {
+            std.fs.accessAbsolute(bin, .{}) catch continue;
 
-            return joined;
+            return bin;
 
-        } else |_| {} // XXX probably nicer syntax for this?
-
-        alloc.free(joined);
+        }
 
     }
 
@@ -30,102 +28,127 @@ pub fn main() !void {
 
     const stdin = std.io.getStdIn().reader();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var global_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    const alloc = gpa.allocator();
+    var loop_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    var buffer: [1024]u8 = undefined;
+    const allocator = loop_arena.allocator();
+
+    const env = try std.process.getEnvMap(global_arena.allocator());
+
+    const env_path = env.get("PATH");
 
     while (true) {
 
+        _ = loop_arena.reset(.retain_capacity);
+
         try stdout.print("$ ", .{});
 
-        const user_input_or_err = stdin.readUntilDelimiter(&buffer, '\n');
+        var buffer: [1024]u8 = undefined;
 
-        if (user_input_or_err == error.EndOfStream) {
+        const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
 
-            try stdout.print("\n", .{});
+        const input = std.mem.trim(u8, user_input, &std.ascii.whitespace);
 
-            break;
+        var args = std.ArrayList([]const u8).init(allocator);
 
-        }
+        var it = std.mem.tokenizeScalar(u8, input, ' ');
 
-        const user_input = try user_input_or_err;
+        while (it.next()) |arg| {
 
-        var it = std.mem.splitScalar(u8, user_input, ' ');
-
-        const cmd = it.first();
-
-        const rest = it.rest();
-
-        if (std.mem.eql(u8, cmd, "exit")) {
-
-            var exit_code: u8 = 0;
-
-            // bash prints an error and exits with 255 if the arg is not
-
-            // an int, no matter how many arguments.
-
-            // zsh prints an error and refuses to exit if there is more than
-
-            // one arg, but exits with 0 if the one arg is not an int.
-
-            // This just always exits with 0 if the number conversion fails.
-
-            if (rest.len > 0)
-
-                exit_code = std.fmt.parseInt(u8, rest, 10) catch 0;
-
-            std.process.exit(exit_code);
+            try args.append(arg);
 
         }
 
-        if (std.mem.eql(u8, cmd, "echo")) {
+        if (args.items.len > 0) {
 
-            try stdout.print("{s}\n", .{rest});
+            const cmd = args.items[0];
 
-            continue;
+            if (std.mem.eql(u8, cmd, "exit")) {
 
-        }
+                var code: u8 = 0;
 
-        if (std.mem.eql(u8, cmd, "type")) {
+                if (args.items.len > 1) code = try std.fmt.parseInt(u8, args.items[1], 10);
 
-            if (std.mem.eql(u8, rest, "exit") or
+                std.process.exit(code);
 
-                std.mem.eql(u8, rest, "echo") or
+            } else if (std.mem.eql(u8, cmd, "echo")) {
 
+                const slice = args.items[1..];
 
-                std.mem.eql(u8, rest, "type"))
+                for (slice, 0..) |arg, i| {
 
-            {
+                    try stdout.print("{s}", .{arg});
 
-                try stdout.print("{s} is a shell builtin\n", .{rest});
-
-            } else {
-
-                const path = try find_on_path(alloc, rest);
-
-                if (path) |p| {
-
-                    defer alloc.free(p);
-
-                    try stdout.print("{s} is {s}\n", .{ rest, p });
-
-                } else {
-
-                    try stdout.print("{s}: not found\n", .{rest});
+                    if (i != slice.len - 1) try stdout.print(" ", .{});
 
                 }
 
+                try stdout.print("\n", .{});
+
+            } else if (std.mem.eql(u8, cmd, "type")) {
+
+                if (args.items.len > 1) {
+
+                    const arg = args.items[1];
+
+                    if (std.mem.eql(u8, arg, "exit") or
+
+                        std.mem.eql(u8, arg, "echo") or
+
+                        std.mem.eql(u8, arg, "type"))
+
+                    {
+
+                        try stdout.print("{s} is a shell builtin\n", .{arg});
+
+                    } else if (try findBinPath(allocator, env_path, arg)) |bin| {
+
+                        try stdout.print("{s} is {s}\n", .{ arg, bin });
+
+                    } else {
+
+                        try stdout.print("{s}: not found\n", .{arg});
+
+                    }
+
+                }
+
+            } else if (try findBinPath(allocator, env_path, cmd)) |bin| {
+
+                const pid = try std.posix.fork();
+
+                if (pid == 0) {
+
+                    const bin_z = try allocator.dupeZ(u8, bin);
+
+                    var args_z = std.ArrayList(?[*:0]const u8).init(allocator);
+
+                    for (args.items) |arg| {
+
+                        try args_z.append(try allocator.dupeZ(u8, arg));
+
+                    }
+
+                    try args_z.append(null);
+
+                    const envp: [*:null]const ?[*:0]const u8 = &.{null};
+
+                    std.posix.execveZ(bin_z, @ptrCast(args_z.items.ptr), envp) catch {};
+
+                    std.process.exit(1);
+
+                }
+
+                _ = std.posix.waitpid(pid, 0);
+
+            } else {
+
+                try stdout.print("{s}: command not found\n", .{cmd});
+
             }
 
-            continue;
-
         }
-
-        // TODO: Handle user input
-
-        try stdout.print("{s}: not found\n", .{cmd});
 
     }
 
