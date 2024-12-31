@@ -1,702 +1,580 @@
 const std = @import("std");
 
-const ShellState = struct {
+fn replace_multiple_spaces(s: []const u8) []u8 {
 
-    should_exit: bool = false,
+    var allocator = std.heap.page_allocator;
 
-    exit_code: u8 = 0,
+    var buffer: []u8 = allocator.alloc(u8, s.len) catch unreachable;
 
-    executables: std.StringHashMap(Executable),
+    var write_index: usize = 0;
 
-    env_path: []const u8,
+    var in_space: bool = false;
 
-    allocator: std.mem.Allocator,
+    for (s) |c| {
 
-    pub fn init(allocator: std.mem.Allocator) ShellState {
+        if (c == ' ') {
 
-        return .{
+            if (!in_space) {
 
-            .should_exit = false,
+                buffer[write_index] = c; // Write the first space
 
-            .exit_code = 0,
+                write_index += 1;
 
-            .env_path = "",
-
-            .executables = std.StringHashMap(Executable).init(allocator),
-
-            .allocator = allocator,
-
-        };
-
-    }
-
-    pub fn deinit(self: *ShellState) void {
-
-        var it = self.executables.iterator();
-
-        while (it.next()) |entry| {
-
-            entry.value_ptr.deinit();
-
-        }
-
-        self.executables.deinit();
-
-    }
-
-};
-
-const Command = struct {
-
-    name: []const u8,
-
-    handler: *const fn (args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void,
-
-};
-
-const echo_command = Command{
-
-    .name = "echo",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            var parsed_args = try parseQuotedArgs(state.allocator, args);
-
-            defer {
-
-                // for (parsed_args.items) |item| {
-
-                //     state.allocator.free(item);
-
-                // }
-
-                parsed_args.deinit();
-
-            }
-
-            for (parsed_args.items, 0..) |arg, i| {
-
-                if (i > 0) try writer.print(" ", .{});
-
-                try writer.print("{s}", .{arg});
-
-            }
-
-            try writer.print("\n", .{});
-
-        }
-
-    }.handler,
-
-};
-
-fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !std.ArrayList([]const u8) {
-
-    var result = std.ArrayList([]const u8).init(allocator);
-
-    errdefer {
-
-        // If we error during parsing, clean up any allocations we made
-
-        // for (result.items) |item| {
-
-        //     allocator.free(item);
-
-        // }
-
-        result.deinit();
-
-    }
-
-    if (args.len == 0) return result;
-
-    var arg_index: usize = 0;
-
-    while (arg_index < args.len) {
-
-        while (arg_index < args.len and args[arg_index] == ' ') {
-
-            arg_index += 1;
-
-        }
-
-        if (arg_index >= args.len) break;
-
-        if (args[arg_index] == '\'') {
-
-            arg_index = arg_index + 1;
-
-            const second_sq = std.mem.indexOf(u8, args[arg_index..], "'").?;
-
-            try result.append(args[arg_index .. arg_index + second_sq]);
-
-            arg_index = arg_index + second_sq + 1;
-
-        } else if (args[arg_index] == '"') {
-
-            arg_index = arg_index + 1;
-
-            var i: usize = 0;
-
-            var temp_arg = try allocator.alloc(u8, 4096);
-
-            defer allocator.free(temp_arg);
-
-            while (arg_index < args.len) {
-
-                if (args[arg_index] == '\\') {
-
-                    // std.debug.print("single \\ detected\n", .{});
-
-                    if (args[arg_index + 1] == '\\') {
-
-                        temp_arg[i] = '\\';
-
-                        i += 1;
-
-                        arg_index += 1;
-
-                        // } else if (args[arg_index + 1] == 'n') {
-
-                        //     temp_arg[i] = '\n';
-
-                        //     i += 1;
-
-                        //     arg_index += 1;
-
-                    } else if (args[arg_index + 1] == '"') {
-
-                        temp_arg[i] = '"';
-
-                        i += 1;
-
-                        arg_index += 1;
-
-                    } else {
-
-                        temp_arg[i] = '\\';
-
-                    }
-
-                    i += 1;
-
-                    arg_index += 1;
-
-                } else if (args[arg_index] == '"') {
-
-                    arg_index += 1;
-
-                    const res = try allocator.dupe(u8, temp_arg[0..i]);
-
-                    try result.append(res);
-
-                    break;
-
-                } else {
-
-                    temp_arg[i] = args[arg_index];
-
-                    i += 1;
-
-                    arg_index += 1;
-
-                }
+                in_space = true; // Set the flag to indicate we're in a space
 
             }
 
         } else {
 
-            var i: usize = 0;
+            buffer[write_index] = c; // Write the non-space character
 
-            var next_arg = try allocator.alloc(u8, 4096);
+            write_index += 1;
 
-            defer allocator.free(next_arg);
-
-            while (args[arg_index] != ' ') {
-
-                // std.debug.print("i: {d}\n", .{i});
-
-                // std.debug.print("arg_index: {d}\n", .{arg_index});
-
-                // std.debug.print("args.len: {d}\n", .{args.len});
-
-                // std.debug.print("args[arg_index]: {c}\n", .{args[arg_index]});
-
-                switch (args[arg_index]) {
-
-                    ' ' => {
-
-                        const res = try allocator.dupe(u8, next_arg[0..i]);
-
-                        try result.append(res);
-
-                        break;
-
-                    },
-
-                    '\\' => {},
-
-                    else => next_arg[i] = args[arg_index],
-
-                }
-
-                i += 1;
-
-                arg_index += 1;
-
-                if (arg_index == args.len) break;
-
-            }
-
-            const res = try allocator.dupe(u8, next_arg[0..i]);
-
-            try result.append(res);
+            in_space = false; // Reset the flag
 
         }
 
     }
 
-    return result;
+    // Resize the buffer to the actual written size
+
+    return buffer[0..write_index];
 
 }
 
-const pwd_command = Command{
-
-    .name = "pwd",
-
-    .handler = struct {
-
-        fn handler(_: []const u8, writer: std.fs.File.Writer, _: *ShellState) anyerror!void {
-
-            var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-
-            _ = try std.posix.getcwd(&buf);
-
-            try writer.print("{s}\n", .{buf});
-
-        }
-
-    }.handler,
-
-};
-
-const exit_command = Command{
-
-    .name = "exit",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, _: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            state.should_exit = true;
-
-            state.exit_code = if (args.len > 0)
-
-                try std.fmt.parseInt(u8, args, 10)
-
-            else
-
-                0;
-
-        }
-
-    }.handler,
-
-};
-
-const type_command = Command{
-
-    .name = "type",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, state: *ShellState) anyerror!void {
-
-            if (commands.has(args)) {
-
-                try writer.print("{s} is a shell builtin\n", .{args});
-
-            } else {
-
-                var new_iter = std.mem.splitScalar(u8, state.env_path, ':');
-
-                while (new_iter.next()) |path| {
-
-                    if (try commandInDir(state.allocator, path, args)) |exe| {
-
-                        try writer.print("{s} is {s}/{s}\n", .{ args, exe.path, args });
-
-                        exe.deinit();
-
-                        return;
-
-                    }
-
-                }
-
-                try writer.print("{s}: not found\n", .{args});
-
-            }
-
-        }
-
-    }.handler,
-
-};
-
-const cd_command = Command{
-
-    .name = "cd",
-
-    .handler = struct {
-
-        fn handler(args: []const u8, writer: std.fs.File.Writer, _: *ShellState) anyerror!void {
-
-            var new_dir = args;
-
-            if (args.len == 0 or std.mem.eql(u8, args, "~")) {
-
-                const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
-
-                new_dir = home;
-
-            } else if (!std.mem.startsWith(u8, args, "/")) {
-
-                var cwdBuf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-
-                const cwd = try std.posix.getcwd(&cwdBuf);
-
-                if (std.mem.eql(u8, args, "./")) {
-
-                    new_dir = cwd;
-
-                } else if (std.mem.eql(u8, args, "../")) {
-
-                    const last_slash = std.mem.lastIndexOf(u8, cwd, "/").?;
-
-                    new_dir = cwd[0..last_slash];
-
-                }
-
-            }
-
-            std.posix.chdir(new_dir) catch |err| switch (err) {
-
-                error.FileNotFound => {
-
-                    try writer.print("cd: {s}: No such file or directory\n", .{args});
-
-                },
-
-                else => return err,
-
-            };
-
-        }
-
-    }.handler,
-
-};
-
-const commands_array = [_]Command{
-
-    echo_command,
-
-    exit_command,
-
-    type_command,
-
-    pwd_command,
-
-    cd_command,
-
-};
-
-const commands = blk: {
-
-    var commands_map_entries: [commands_array.len]struct { []const u8, Command } = undefined;
-
-    for (commands_array, 0..) |cmd, i| {
-
-        commands_map_entries[i] = .{ cmd.name, cmd };
-
-    }
-
-    break :blk std.StaticStringMap(Command).initComptime(commands_map_entries);
-
-};
-
-pub fn main() !u8 {
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
-    const allocator = gpa.allocator();
-
-    defer _ = gpa.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-
-    defer arena.deinit();
-
-    const arena_allocator = arena.allocator();
+pub fn main() !void {
 
     const stdout = std.io.getStdOut().writer();
 
-    var shell_state = ShellState.init(arena_allocator);
+    const stdin = std.io.getStdIn().reader();
 
-    defer shell_state.deinit();
+    const allocator = std.heap.page_allocator;
 
-    var env_vars = try std.process.getEnvMap(allocator);
+    // Get PATH environment variable
 
-    defer env_vars.deinit();
+    const path = try std.process.getEnvVarOwned(allocator, "PATH");
 
-    const env_path = env_vars.get("PATH") orelse return error.PathNotSet;
-
-    shell_state.env_path = env_path;
-
-    // try stdout.print("Welcome to the meh interactive shell\n", .{});
-
-    // try stdout.print("May your computing be prosperous\n", .{});
-
-    // try stdout.print("------------------------------------\n", .{});
+    defer allocator.free(path);
 
     while (true) {
 
         try stdout.print("$ ", .{});
 
-        const stdin = std.io.getStdIn().reader();
-
         var buffer: [1024]u8 = undefined;
 
-        const user_input = stdin.readUntilDelimiter(&buffer, '\n') catch |err| switch (err) {
+        const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
 
-            error.EndOfStream => break,
+        // Check if the command is "cd"
 
-            else => return err,
+        if (std.mem.startsWith(u8, user_input, "cd ")) {
 
-        };
+            const dir_path = std.mem.trim(u8, user_input[3..], " ");
 
-        var inputs = std.mem.splitAny(u8, user_input, " ");
+            if (std.mem.eql(u8, dir_path, "~")) {
 
-        const command = inputs.first();
+                const home = try std.process.getEnvVarOwned(allocator, "HOME");
 
-        const args = inputs.rest();
+                defer allocator.free(home);
 
-        if (commands.get(command)) |cmd| {
+                if (std.posix.chdir(home)) {} else |_| {
 
-            try cmd.handler(args, stdout, &shell_state);
+                    try stdout.print("cd: {s}: No such file or directory\n", .{home});
 
-        } else {
+                }
 
-            var is_complete = false;
+            } else {
 
-            var new_iter = std.mem.splitScalar(u8, shell_state.env_path, ':');
+                if (std.posix.chdir(dir_path)) {} else |_| {
 
-            while (new_iter.next()) |path| {
-
-                if (try commandInDir(shell_state.allocator, path, command)) |exe| {
-
-                    is_complete = true;
-
-                    const full_path = try std.fs.path.join(allocator, &.{ exe.path, exe.name });
-
-                    defer allocator.free(full_path);
-
-                    var argv = std.ArrayList([]const u8).init(allocator);
-
-                    defer argv.deinit();
-
-                    try argv.append(full_path);
-
-                    var parsed_args = try parseQuotedArgs(shell_state.allocator, args);
-
-                    defer {
-
-                        // Clean up all our allocations when we're done
-
-                        // for (parsed_args.items) |item| {
-
-                        //     shell_state.allocator.free(item);
-
-                        // }
-
-                        parsed_args.deinit();
-
-                    }
-
-                    for (parsed_args.items) |arg| {
-
-                        try argv.append(arg);
-
-                    }
-
-                    // Before executing the command:
-
-                    // std.debug.print("Arguments for {s}:\n", .{command});
-
-                    // for (argv.items, 0..) |arg, i| {
-
-                    //     std.debug.print("  arg[{d}]: '{s}'\n", .{ i, arg });
-
-                    // }
-
-                    var child = std.process.Child.init(argv.items, allocator);
-
-                    _ = try child.spawnAndWait();
-
-                    defer exe.deinit();
-
-                    break;
+                    try stdout.print("cd: {s}: No such file or directory\n", .{dir_path});
 
                 }
 
             }
 
-            if (!is_complete) {
+            continue;
 
-                try stdout.print("{s}: command not found\n", .{user_input});
+        }
+
+        // Check if the command is "pwd"
+
+        if (std.mem.eql(u8, user_input, "pwd")) {
+
+            var pwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+
+            const pwd = try std.fs.cwd().realpath(".", &pwd_buf);
+
+            try stdout.print("{s}\n", .{pwd});
+
+            continue;
+
+        }
+
+        // Check if the command is "type"
+
+        if (std.mem.startsWith(u8, user_input, "type ")) {
+
+            const command = std.mem.trim(u8, user_input[5..], " ");
+
+            // First check if it's a builtin
+
+            if (std.mem.eql(u8, command, "echo") or
+
+                std.mem.eql(u8, command, "exit") or
+
+                std.mem.eql(u8, command, "type") or
+
+                std.mem.eql(u8, command, "pwd") or
+
+                std.mem.eql(u8, command, "cd"))
+
+            {
+
+                try stdout.print("{s} is a shell builtin\n", .{command});
+
+                continue;
+
+            }
+
+            // Search in PATH
+
+            var found = false;
+
+            var path_it = std.mem.split(u8, path, ":");
+
+            while (path_it.next()) |dir| {
+
+                var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+
+                const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, command });
+
+                const file = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+
+                file.close();
+
+                try stdout.print("{s} is {s}\n", .{ command, full_path });
+
+                found = true;
+
+                break;
+
+            }
+
+            if (!found) {
+
+                try stdout.print("{s}: not found\n", .{command});
+
+            }
+
+            continue;
+
+        }
+
+        // Check if the command is "echo"
+
+        if (std.mem.startsWith(u8, user_input, "echo ")) {
+
+            var args = std.ArrayList([]const u8).init(allocator);
+
+            defer args.deinit();
+
+            var result = std.ArrayList(u8).init(allocator);
+
+            defer result.deinit();
+
+            var i: usize = 5; // Skip "echo "
+
+            var in_quotes = false;
+
+            var quote_char: u8 = 0;
+
+            var escaped = false;
+
+            while (i < user_input.len) {
+
+                const c = user_input[i];
+
+                if (escaped) {
+
+
+                    if (!in_quotes or quote_char == '"') {
+
+                        if (quote_char == '"' and c == ' ') {
+
+                            try result.append('\\');
+
+                        }
+
+
+                    } else {
+
+                        // In single quotes, preserve the backslash and the character
+
+                        try result.append('\\');
+
+                        try result.append(c);
+
+                    }
+
+                    try result.append(c);
+
+                    escaped = false;
+
+                } else {
+
+                    switch (c) {
+
+                        '\\' => {
+
+                            if (!in_quotes or quote_char == '"') {
+
+                                escaped = true;
+
+                            } else {
+
+                                // In single quotes, treat backslash as literal
+
+                                try result.append(c);
+
+                            }
+
+                        },
+
+                        '\'' => {
+
+                            if (in_quotes and quote_char == '"') {
+
+                                // If we're in double quotes, treat single quote as literal
+
+                                try result.append(c);
+
+                            } else if (!in_quotes) {
+
+                                if (result.items.len > 0) {
+
+                                    try args.append(try allocator.dupe(u8, result.items));
+
+                                    result.clearRetainingCapacity();
+
+                                }
+
+                                in_quotes = true;
+
+                                quote_char = '\'';
+
+                            } else if (quote_char == '\'') {
+
+                                if (result.items.len > 0) {
+
+                                    try args.append(try allocator.dupe(u8, result.items));
+
+                                }
+
+                                result.clearRetainingCapacity();
+
+                                in_quotes = false;
+
+                            }
+
+                        },
+
+                        '"' => {
+
+                            if (in_quotes and quote_char == '\'') {
+
+                                // Inside single quotes, treat double quote as literal
+
+                                try result.append(c);
+
+                            } else if (!in_quotes) {
+
+                                if (result.items.len > 0) {
+
+                                    try args.append(try allocator.dupe(u8, result.items));
+
+                                    result.clearRetainingCapacity();
+
+                                }
+
+                                in_quotes = true;
+
+                                quote_char = '"';
+
+                            } else if (quote_char == '"') {
+
+                                if (result.items.len > 0) {
+
+                                    try args.append(try allocator.dupe(u8, result.items));
+
+                                }
+
+                                result.clearRetainingCapacity();
+
+                                in_quotes = false;
+
+                            }
+
+                        },
+
+                        ' ' => {
+
+                            if (!in_quotes) {
+
+                                if (result.items.len > 0) {
+
+                                    try args.append(try allocator.dupe(u8, result.items));
+
+                                    result.clearRetainingCapacity();
+
+                                }
+
+                            } else {
+
+                                try result.append(c);
+
+                            }
+
+                        },
+
+                        else => try result.append(c),
+
+                    }
+
+                }
+
+                i += 1;
+
+            }
+
+            // Append any remaining content
+
+            if (result.items.len > 0) {
+
+                try args.append(try allocator.dupe(u8, result.items));
+
+            }
+
+            // Print all arguments with a single space between them
+
+            for (args.items, 0..) |arg, index| {
+
+                try stdout.print("{s}", .{arg});
+
+                if (index < args.items.len - 1) {
+
+                    try stdout.print(" ", .{});
+
+                }
+
+            }
+
+            try stdout.print("\n", .{});
+
+            continue;
+
+        }
+
+        // Check if the command is "exit"
+
+        if (std.mem.startsWith(u8, user_input, "exit")) {
+
+            // Get the exit code if provided
+
+            var exit_code: u8 = 0;
+
+            if (user_input.len > 4) {
+
+                const code_str = std.mem.trim(u8, user_input[4..], " ");
+
+                exit_code = std.fmt.parseInt(u8, code_str, 10) catch 0;
+
+            }
+
+            std.process.exit(exit_code);
+
+        } else {
+
+            var args = std.ArrayList([]const u8).init(allocator);
+
+            defer args.deinit();
+
+            var i: usize = 0;
+
+            var start: usize = 0;
+
+            var in_quotes = false;
+
+            var quote_char: u8 = 0;
+
+            var escaped = false;
+
+            while (i < user_input.len) {
+
+                if (escaped) {
+
+                    i += 1;
+
+                    escaped = false;
+
+                    continue;
+
+                }
+
+                switch (user_input[i]) {
+
+                    '\\' => {
+
+                        if (!in_quotes or quote_char == '"') {
+
+                            escaped = true;
+
+                        }
+
+                    },
+
+                    '\'' => {
+
+                        if (!in_quotes) {
+
+                            if (start < i) try args.append(user_input[start..i]);
+
+                            start = i + 1;
+
+                            in_quotes = true;
+
+                            quote_char = '\'';
+
+                        } else if (quote_char == '\'') {
+
+                            try args.append(user_input[start..i]);
+
+                            start = i + 1;
+
+                            in_quotes = false;
+
+                        }
+
+                    },
+
+                    '"' => {
+
+                        if (!in_quotes) {
+
+                            if (start < i) try args.append(user_input[start..i]);
+
+                            start = i + 1;
+
+                            in_quotes = true;
+
+                            quote_char = '"';
+
+                        } else if (quote_char == '"') {
+
+                            try args.append(user_input[start..i]);
+
+                            start = i + 1;
+
+                            in_quotes = false;
+
+                        }
+
+                    },
+
+                    ' ' => {
+
+                        if (!in_quotes and !escaped) {
+
+                            if (start < i) {
+
+                                try args.append(user_input[start..i]);
+
+                            }
+
+                            start = i + 1;
+
+                        }
+
+                    },
+
+                    else => {},
+
+                }
+
+                i += 1;
+
+            }
+
+            // Append any remaining content before searching PATH
+
+            if (start < user_input.len) {
+
+                try args.append(user_input[start..]);
+
+            }
+
+            if (args.items.len == 0) continue;
+
+            // Search in PATH
+
+            var found = false;
+
+            var path_it = std.mem.split(u8, path, ":");
+
+            while (path_it.next()) |dir| {
+
+                var path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+
+                const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, args.items[0] });
+
+                const file = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+
+                file.close();
+
+                // Create a new array for the full command (including the full path)
+
+                var cmd = std.ArrayList([]const u8).init(allocator);
+
+                defer cmd.deinit();
+
+                // Add the full path as the first argument
+
+                try cmd.append(full_path);
+
+                // Add all the remaining arguments
+
+                for (args.items[1..]) |arg| {
+
+                    try cmd.append(arg);
+
+                }
+
+                // Found the executable, try to run it
+
+                var child = std.process.Child.init(cmd.items, allocator);
+
+                child.stdin_behavior = .Inherit;
+
+                child.stdout_behavior = .Inherit;
+
+                child.stderr_behavior = .Inherit;
+
+                try child.spawn();
+
+                _ = try child.wait();
+
+                found = true;
+
+                break;
+
+            }
+
+            if (!found) {
+
+                try stdout.print("{s}: command not found\n", .{args.items[0]});
 
             }
 
         }
-
-        if (shell_state.should_exit) {
-
-            return shell_state.exit_code;
-
-        }
-
-    }
-
-    try stdout.print("Exiting shell... Thanks for playing.\n", .{});
-
-    return 1;
-
-}
-
-const Executable = struct {
-
-    name: []const u8,
-
-    path: []const u8,
-
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *const Executable) void {
-
-        self.allocator.free(self.name);
-
-        self.allocator.free(self.path);
-
-    }
-
-};
-
-fn commandInDir(allocator: std.mem.Allocator, path: []const u8, command: []const u8) !?Executable {
-
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
-
-        error.FileNotFound => return null,
-
-        else => return null,
-
-    };
-
-    defer dir.close();
-
-    var iter = dir.iterate();
-
-    while (try iter.next()) |entry| {
-
-        const name = try allocator.dupe(u8, entry.name);
-
-        errdefer allocator.free(name);
-
-        if (std.mem.eql(u8, name, command)) {
-
-            return Executable{ .name = name, .path = try allocator.dupe(u8, path), .allocator = allocator };
-
-        }
-
-        // If we didn't find a match, free the name we allocated
-
-        allocator.free(name);
-
-    }
-
-    return null;
-
-}
-
-fn processPathDir(allocator: std.mem.Allocator, path: []const u8, state: *ShellState) !void {
-
-    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |err| switch (err) {
-
-        error.FileNotFound => {
-
-            // std.debug.print("Directory not found: {s}\n", .{path});
-
-            return;
-
-        },
-
-        else => {
-
-            // std.debug.print("Error opening directory {s}: {any}\n", .{ path, err });
-
-            return;
-
-        },
-
-    };
-
-    defer dir.close();
-
-    // Iterate over all entries
-
-    var iter = dir.iterate();
-
-    while (try iter.next()) |entry| {
-
-        // if (entry.kind == .file or entry.kind == .sym_link) {
-
-        // const file_stat = try dir.statFile(entry.name);
-
-        // const is_executable = (file_stat.mode & std.os.linux.S.IXUSR) != 0 or
-
-        //     (file_stat.mode & std.os.linux.S.IXGRP) != 0 or
-
-        //     (file_stat.mode & std.os.linux.S.IXOTH) != 0;
-
-        // if (is_executable) {
-
-        const name = try allocator.dupe(u8, entry.name);
-
-        errdefer allocator.free(name);
-
-        if (!state.executables.contains(name)) {
-
-            try state.executables.put(name, .{
-
-                .name = name,
-
-                .path = try allocator.dupe(u8, path),
-
-                .allocator = allocator,
-
-            });
-
-        } else {
-
-            allocator.free(name);
-
-        }
-
-        // }
-
-        // }
 
     }
 
