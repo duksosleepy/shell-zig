@@ -72,7 +72,6 @@ const echo_command = Command{
 
                 // }
 
-
                 parsed_args.args.deinit();
 
             }
@@ -89,6 +88,8 @@ const echo_command = Command{
 
             const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
 
+            const current_stderr = try std.posix.dup(std.posix.STDERR_FILENO);
+
             if (parsed_args.redirect_info) |redirect_info| {
 
                 // std.debug.print("redirect_info present, should redirect.\n", .{});
@@ -96,7 +97,15 @@ const echo_command = Command{
                 // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
 
 
-                try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO);
+                //
+
+                switch (redirect_info.redirect_type) {
+
+                    .stdout => try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO),
+
+                    .stderr => try std.posix.dup2(redirect_info.fd, std.posix.STDERR_FILENO),
+
+                }
 
             }
 
@@ -110,9 +119,15 @@ const echo_command = Command{
 
             try writer.print("\n", .{});
 
-            if (parsed_args.redirect_info) |_| {
+            if (parsed_args.redirect_info) |redirect_info| {
 
-                try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO);
+                switch (redirect_info.redirect_type) {
+
+                    .stdout => try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO),
+
+                    .stderr => try std.posix.dup2(current_stderr, std.posix.STDERR_FILENO),
+
+                }
 
             }
 
@@ -122,12 +137,13 @@ const echo_command = Command{
 
 };
 
-
 const CommandData = struct { args: std.ArrayList([]const u8), redirect_info: ?struct {
 
     fd: i32,
 
     target_file: []const u8,
+
+    redirect_type: StandardFd,
 
 } };
 
@@ -249,7 +265,10 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !CommandData 
 
                 // std.debug.print("arg_index: {d}\n", .{arg_index});
 
-                if (is_redirect(args, &arg_index)) {
+
+                const redir_info = is_redirect(args, &arg_index);
+
+                if (redir_info.should_redirect) {
 
                     // std.debug.print("redirect detected\n", .{});
 
@@ -295,7 +314,8 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !CommandData 
 
                     // std.debug.print("fd: {d}\n", .{file.handle});
 
-                    command_data.redirect_info = .{ .fd = file.handle, .target_file = redirect_item };
+
+                    command_data.redirect_info = .{ .fd = file.handle, .redirect_type = redir_info.redirect_type.?, .target_file = redirect_item };
 
                     break;
 
@@ -329,23 +349,26 @@ fn parseQuotedArgs(allocator: std.mem.Allocator, args: []const u8) !CommandData 
 
     if (current_arg.items.len > 0) {
 
-
         const result_item = try allocator.dupe(u8, current_arg.items);
 
         try command_data.args.append(result_item);
 
     }
 
-
     return command_data;
 
 }
 
-fn is_redirect(args: []const u8, index: *usize) bool {
+const StandardFd = enum { stdout, stderr };
+
+const RedirectInfo = struct { should_redirect: bool, redirect_type: ?StandardFd };
+
+fn is_redirect(args: []const u8, index: *usize) RedirectInfo {
 
     if (args.len <= index.* + 1) {
 
-        return false;
+
+        return RedirectInfo{ .should_redirect = false, .redirect_type = undefined };
 
     }
 
@@ -353,7 +376,16 @@ fn is_redirect(args: []const u8, index: *usize) bool {
 
         index.* = index.* + 2;
 
-        return true;
+
+        return RedirectInfo{ .should_redirect = true, .redirect_type = .stdout };
+
+    }
+
+    if (args[index.*] == '2' and args[index.* + 1] == '>') {
+
+        index.* = index.* + 2;
+
+        return RedirectInfo{ .should_redirect = true, .redirect_type = .stderr };
 
     }
 
@@ -361,11 +393,11 @@ fn is_redirect(args: []const u8, index: *usize) bool {
 
         index.* = index.* + 1;
 
-        return true;
+        return RedirectInfo{ .should_redirect = true, .redirect_type = .stdout };
 
     }
 
-    return false;
+    return RedirectInfo{ .should_redirect = false, .redirect_type = undefined };
 
 }
 
@@ -709,7 +741,6 @@ pub fn main() !u8 {
 
                         // }
 
-
                         parsed_args.args.deinit();
 
                     }
@@ -742,13 +773,21 @@ pub fn main() !u8 {
 
                     const current_stdout = try std.posix.dup(std.posix.STDOUT_FILENO);
 
+                    const current_stderr = try std.posix.dup(std.posix.STDERR_FILENO);
+
                     if (parsed_args.redirect_info) |redirect_info| {
 
                         // std.debug.print("redirect_info present, should redirect.\n", .{});
 
                         // std.debug.print("fd: {d}, target_file: {s}\n", .{ redirect_info.fd, redirect_info.target_file });
 
-                        try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO);
+                        switch (redirect_info.redirect_type) {
+
+                            .stdout => try std.posix.dup2(redirect_info.fd, std.posix.STDOUT_FILENO),
+
+                            .stderr => try std.posix.dup2(redirect_info.fd, std.posix.STDERR_FILENO),
+
+                        }
 
                     }
 
@@ -756,9 +795,16 @@ pub fn main() !u8 {
 
                     _ = try child.spawnAndWait();
 
-                    if (parsed_args.redirect_info) |_| {
 
-                        try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO);
+                    if (parsed_args.redirect_info) |redirect_info| {
+
+                        switch (redirect_info.redirect_type) {
+
+                            .stdout => try std.posix.dup2(current_stdout, std.posix.STDOUT_FILENO),
+
+                            .stderr => try std.posix.dup2(current_stderr, std.posix.STDERR_FILENO),
+
+                        }
 
                     }
 
