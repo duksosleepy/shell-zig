@@ -1,166 +1,282 @@
 const std = @import("std");
 
-const mem = std.mem;
+/// Shell implementation
 
-const util = @import("util.zig");
+///
 
-const Pal = @import("pal.zig").Current;
+/// Provides a basic shell interface with support for:
 
-const debug = true;
+/// - Built-in commands
 
-fn trace(comptime format: []const u8, args: anytype) void {
+/// - External command execution
 
-    if (debug) {
+/// - Environment variables (todo)
 
-        const writer = std.io.getStdOut().writer();
+/// - Command history (todo)
 
-        writer.print("  TRACE | ", .{}) catch unreachable;
+const Shell = struct {
 
-        writer.print(format, args) catch unreachable;
+    stdout: std.fs.File.Writer,
 
-        writer.print("\n", .{}) catch unreachable;
+    stdin: std.fs.File.Reader,
 
-    }
+    pub fn init() !Shell {
 
-}
+        return Shell{
 
-const Result = union(enum) {
+            .stdout = std.io.getStdOut().writer(),
 
-    exit: u8,
+            .stdin = std.io.getStdIn().reader(),
 
-    cont,
-
-    pub fn cont() Result {
-
-        return Result{ .cont = {} };
+        };
 
     }
 
-    pub fn exit(code: u8) Result {
+    pub fn run(self: *Shell) !void {
 
-        return Result{ .exit = code };
+        while (true) {
 
-    }
+            try self.prompt();
 
-};
-
-const Context = struct {
-
-    allocator: std.mem.Allocator,
-
-    env_map: std.process.EnvMap,
-
-    writer: std.fs.File.Writer,
-
-};
-
-const BuiltinSymbolKind = enum { exit, echo, type, pwd, cd };
-
-const BuiltinSymbol = struct { name: []const u8, kind: BuiltinSymbolKind };
-
-const FileSymbol = struct { name: []const u8, path: []const u8 };
-
-const UnknownSymbol = struct { name: []const u8 };
-
-const SymbolType = enum { builtin, file, unknown };
-
-const Symbol = union(SymbolType) {
-
-    builtin: BuiltinSymbol,
-
-    file: FileSymbol,
-
-    unknown: UnknownSymbol,
-
-};
-
-fn nextInput(reader: anytype, buffer: []u8) ?[]const u8 {
-
-    const line = reader.readUntilDelimiterOrEof(buffer, '\n') catch {
-
-        return null;
-
-    };
-
-    if (line) |l| {
-
-        if (Pal.trim_cr) {
-
-            return mem.trimRight(u8, l, "\r");
-
-        } else {
-
-            return l;
+            try self.processCommand();
 
         }
 
-    } else {
+    }
 
-        return null;
+    fn prompt(self: *Shell) !void {
+
+        try self.stdout.print("$ ", .{});
 
     }
 
-}
+    fn processCommand(self: *Shell) !void {
 
-fn resolveBuiltinSymbol(symbol_name: []const u8) ?BuiltinSymbol {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    if (mem.eql(u8, symbol_name, "exit")) {
+        defer arena.deinit();
 
-        return BuiltinSymbol{ .name = symbol_name, .kind = .exit };
+        const allocator = arena.allocator();
 
-    } else if (mem.eql(u8, symbol_name, "echo")) {
+        const user_input = try self.stdin.readUntilDelimiterAlloc(allocator, '\n', 1024);
 
-        return BuiltinSymbol{ .name = symbol_name, .kind = .echo };
+        defer allocator.free(user_input);
 
-    } else if (mem.eql(u8, symbol_name, "type")) {
+        if (user_input.len == 0) return;
 
-        return BuiltinSymbol{ .name = symbol_name, .kind = .type };
+        var it = std.mem.splitAny(u8, user_input, " ");
 
-    } else if (mem.eql(u8, symbol_name, "pwd")) {
+        const cmd = it.next().?;
 
-        return BuiltinSymbol{ .name = symbol_name, .kind = .pwd };
+        const args = it.rest();
 
-    } else if (mem.eql(u8, symbol_name, "cd")) {
+        if (BuiltinCommands.isBuiltin(cmd)) {
 
-        return BuiltinSymbol{ .name = symbol_name, .kind = .cd };
+            const builtin = BuiltinCommands.get(cmd).?;
 
-    } else {
+            try builtin.handler(args, self.stdout);
 
-        return null;
+            return;
+
+        }
+
+        const path = std.posix.getenv("PATH").?;
+
+        const full_path = find_in_path(path, cmd);
+
+        if (full_path != null) {
+
+            try handle_exec(full_path.?, args, self.stdout);
+
+            return;
+
+        }
+
+        try self.stdout.print("{s}: command not found\n", .{user_input});
 
     }
 
-}
+};
 
-fn resolveFileSymbol(ctx: Context, symbol_name: []const u8) ?FileSymbol {
+// UNUSED!
 
-    const path = ctx.env_map.get("PATH") orelse "";
+const Environment = struct {
 
-    const cwd = std.fs.cwd();
+    vars: std.StringHashMap([]const u8),
 
-    var search_dirs = std.mem.split(u8, path, Pal.path_separator);
+    pub fn init(allocator: std.mem.Allocator) Environment {
 
-    while (search_dirs.next()) |dir_path| {
+        return Environment{
 
-        const dir = cwd.openDir(dir_path, .{ .iterate = true }) catch continue;
+            .vars = std.StringHashMap([]const u8).init(allocator),
 
-        var files = dir.iterate();
+        };
 
-        while (files.next() catch null) |entry| {
+    }
 
-            if (@as(?std.fs.Dir.Entry, entry)) |file| {
+    pub fn get(self: *const Environment, key: []const u8) ?[]const u8 {
 
-                if (mem.eql(u8, file.name, symbol_name)) {
+        return self.vars.get(key);
 
-                    const program_path = util.join_path(ctx.allocator, dir_path, symbol_name);
+    }
 
-                    return FileSymbol{ .name = symbol_name, .path = program_path };
+    pub fn set(self: *Environment, key: []const u8, value: []const u8) !void {
 
-                }
+        try self.vars.put(key, value);
+
+    }
+
+};
+
+const Command = struct {
+
+    kind: Builtin,
+
+    handler: *const fn ([]const u8, std.fs.File.Writer) anyerror!void,
+
+};
+
+const Builtin = enum {
+
+    exit,
+
+    echo,
+
+    type_,
+
+    pwd,
+
+    cd,
+
+    // Map enum values to their string representations
+
+    pub const map = std.StaticStringMap(Builtin).initComptime(.{
+
+        .{ "exit", .exit },
+
+        .{ "echo", .echo },
+
+        .{ "type", .type_ },
+
+        .{ "pwd", .pwd },
+
+        .{ "cd", .cd },
+
+    });
+
+    // Get enum from string
+
+    pub fn fromString(s: []const u8) ?Builtin {
+
+        return map.get(s);
+
+    }
+
+    // Get string from enum
+
+    pub fn toString(self: Builtin) []const u8 {
+
+        return switch (self) {
+
+            .exit => "exit",
+
+            .echo => "echo",
+
+            .type_ => "type",
+
+            .pwd => "pwd",
+
+            .cd => "cd",
+
+        };
+
+    }
+
+};
+
+const BuiltinCommands = struct {
+
+    // Define commands with their handlers at compile time
+
+    const commands = [_]Command{
+
+        .{ .kind = .exit, .handler = &handle_exit },
+
+        .{ .kind = .echo, .handler = &handle_echo },
+
+        .{ .kind = .type_, .handler = &handle_type },
+
+        .{ .kind = .pwd, .handler = &handle_pwd },
+
+        .{ .kind = .cd, .handler = &handle_cd },
+
+    };
+
+    pub fn isBuiltin(string: []const u8) bool {
+
+        return Builtin.map.has(string);
+
+    }
+
+    pub fn get(name: []const u8) ?Command {
+
+        // First convert string to enum
+
+        const builtin = Builtin.fromString(name) orelse return null;
+
+        // Then find matching command
+
+        for (commands) |cmd| {
+
+            if (cmd.kind == builtin) {
+
+                return cmd;
 
             }
 
         }
+
+        return null;
+
+    }
+
+};
+
+/// Searches for a command in the system PATH.
+
+///
+
+/// Parameters:
+
+///   - `path`: A string slice representing the PATH environment variable.
+
+///   - `command`: The command name to search for.
+
+///
+
+/// Returns:
+
+///   - An optional slice of bytes representing the full path to the command if found.
+
+fn find_in_path(path: []const u8, command: []const u8) ?[]u8 {
+
+    var iterator = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+
+    while (iterator.next()) |dir_path| {
+
+        // TODO: This does not handle relative paths
+
+        const dir = std.fs.openDirAbsolute(dir_path, .{}) catch continue;
+
+        const file_status = dir.statFile(command) catch continue;
+
+        if (file_status.mode == 0) {
+
+            continue;
+
+        }
+
+        return std.fs.path.join(std.heap.page_allocator, &[_][]const u8{ dir_path, command }) catch null;
 
     }
 
@@ -168,251 +284,186 @@ fn resolveFileSymbol(ctx: Context, symbol_name: []const u8) ?FileSymbol {
 
 }
 
-fn resolveSymbol(ctx: Context, symbol_name: []const u8) Symbol {
+fn handle_echo(rest: []const u8, stdout: std.fs.File.Writer) !void {
 
-    if (resolveBuiltinSymbol(symbol_name)) |builtin| {
-
-        return Symbol{ .builtin = builtin };
-
-    } else if (resolveFileSymbol(ctx, symbol_name)) |file| {
-
-        return Symbol{ .file = file };
-
-    } else {
-
-        return Symbol{ .unknown = UnknownSymbol{ .name = symbol_name } };
-
-    }
+    try stdout.print("{s}\n", .{rest});
 
 }
 
-fn handleExitCommand(args: []const u8) !Result {
+/// Prints working directory
 
-    const code_text, _ = util.splitAtNext(args, " ");
+fn handle_pwd(_: []const u8, stdout: std.fs.File.Writer) !void {
 
-    const code = try std.fmt.parseInt(u8, code_text, 10);
+    // allocate a large enough buffer to store the cwd
 
-    return Result.exit(code);
+    var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
 
-}
+    // getcwd writes the path of the cwd into buf and returns a slice of buf with the len of cwd
 
-fn handleEchoCommand(ctx: Context, args: []const u8) !Result {
+    const cwd = try std.posix.getcwd(&buf);
 
-    try ctx.writer.print("{s}\n", .{args});
+    // const pwd = std.posix.getenv("PWD").?;
 
-    return Result.cont();
+    // print out results
 
-}
-
-fn handleTypeCommand(ctx: Context, args: []const u8) !Result {
-
-    const type_text, _ = util.splitAtNext(args, " ");
-
-    const symbol = resolveSymbol(ctx, type_text);
-
-    const builtin = "{s} is a shell builtin\n";
-
-    const is_program = "{s} is {s}\n";
-
-    const not_found = "{s}: not found\n";
-
-    switch (symbol) {
-
-        .builtin => |builtin_symbol| try ctx.writer.print(builtin, .{builtin_symbol.name}),
-
-        .file => |file_symbol| try ctx.writer.print(is_program, .{ file_symbol.name, file_symbol.path }),
-
-        .unknown => try ctx.writer.print(not_found, .{type_text}),
-
-    }
-
-    return Result.cont();
+    try stdout.print("{s}\n", .{cwd});
 
 }
 
-fn handlePwdCommand(ctx: Context) !Result {
+fn handle_exit(rest: []const u8, _: std.fs.File.Writer) !void {
 
-    const cwd = try std.fs.cwd().realpathAlloc(ctx.allocator, ".");
+    const exit_code = std.fmt.parseInt(u8, std.mem.trim(u8, rest, " "), 10) catch 0;
 
-    try ctx.writer.print("{s}\n", .{cwd});
-
-    return Result.cont();
+    std.posix.exit(exit_code);
 
 }
 
-fn handleCdCommand(ctx: Context, args: []const u8) !Result {
+fn handle_cd(rest: []const u8, stdout: std.fs.File.Writer) !void {
 
+    const dest = blk: {
 
-    const dir_path = if (mem.eql(u8, args, "~"))
+        if (rest.len == 0 or (rest.len == 1 and rest[0] == '~')) {
 
-        ctx.env_map.get("HOME") orelse ""
+            const home = std.posix.getenv("HOME") orelse unreachable;
 
-    else
+            break :blk home;
 
-        args;
+        }
 
-    const dir = std.fs.cwd().openDir(dir_path, .{}) catch {
-
-        try ctx.writer.print("cd: {s}: No such file or directory\n", .{args});
-
-        return Result.cont();
+        break :blk rest;
 
     };
 
-    try dir.setAsCwd();
+    // zig std.posix.chdir handles both absolute and relative paths correctly
 
-    return Result.cont();
-
-}
-
-fn tryHandleBuiltin(ctx: Context, input: []const u8) !?Result {
-
-    const cmd, const args = util.splitAtNext(input, " ");
-
-    if (resolveBuiltinSymbol(cmd)) |builtin| {
-
-        return switch (builtin.kind) {
-
-            .exit => try handleExitCommand(args),
-
-            .echo => try handleEchoCommand(ctx, args),
-
-            .type => try handleTypeCommand(ctx, args),
-
-            .pwd => try handlePwdCommand(ctx),
-
-            .cd => try handleCdCommand(ctx, args),
-
-        };
-
-    } else {
-
-        return null;
-
-    }
+    std.posix.chdir(dest) catch try stdout.print("cd: {s}: No such file or directory\n", .{rest});
 
 }
 
-fn tryHandleRunProcess(ctx: Context, input: []const u8) !?Result {
+fn handle_type(rest: []const u8, stdout: std.fs.File.Writer) !void {
 
-    const run_prefix = "";
+    if (BuiltinCommands.isBuiltin(rest)) {
 
-    if (!mem.startsWith(u8, input, run_prefix)) {
+        try stdout.print("{s} is a shell builtin\n", .{rest});
 
-        return null;
+        return;
+
+    }
+
+    const path = std.posix.getenv("PATH") orelse unreachable;
+
+    const file_path = find_in_path(path, rest);
+
+    if (file_path != null) { // no single letter commands (0-terminated strings)
+
+        try stdout.print("{s} is {s}\n", .{ rest, file_path.? });
+
+        return;
 
     }
 
-    const cmd, const args = util.splitAtNext(input, " ");
-
-    const process_name = cmd[run_prefix.len..];
-
-    if (resolveFileSymbol(ctx, process_name)) |file| {
-
-        const argv = [_][]const u8{ file.path, args };
-
-        var proc = std.process.Child.init(&argv, ctx.allocator);
-
-        const term = try proc.spawnAndWait();
-
-        return switch (term) {
-
-            .Exited => |code| if (code == 0) Result.cont() else Result.exit(1),
-
-            else => Result.exit(1),
-
-        };
-
-    } else {
-
-        return null;
-
-    }
+    try stdout.print("{s}: not found\n", .{rest});
 
 }
 
-fn handleUnknown(ctx: Context, input: []const u8) !Result {
+fn handle_exec(command: []const u8, args: []const u8, stdout: std.fs.File.Writer) !void {
 
-    const cmd, _ = util.splitAtNext(input, " ");
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    try ctx.writer.print("{s}: command not found\n", .{cmd});
+    defer arena.deinit();
 
-    return Result.cont();
+    const allocator = arena.allocator();
 
-}
+    var argv = std.ArrayList([]const u8).init(allocator);
 
-fn handleInput(ctx: Context, input: []const u8) !Result {
+    try argv.append(command);
 
-    if (try tryHandleBuiltin(ctx, input)) |result| {
+    // split args string into individual arguments
 
-        return result;
+    var args_iterator = std.mem.splitScalar(u8, args, ' ');
 
-    } else if (try tryHandleRunProcess(ctx, input)) |result| {
+    while (args_iterator.next()) |arg| {
 
-        return result;
+        if (arg.len > 0) { // Only append non-empty arguments
 
-    } else {
-
-        return try handleUnknown(ctx, input);
-
-    }
-
-}
-
-pub fn main() !u8 {
-
-    const stdout = std.io.getStdOut().writer();
-
-    const stdin = std.io.getStdIn().reader();
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
-    defer {
-
-        const deinit_status = gpa.deinit();
-
-        //fail test; can't try in defer as defer is executed after we return
-
-        if (deinit_status == .leak) std.testing.expect(false) catch @panic("TEST FAIL");
-
-    }
-
-    var env_map = try std.process.getEnvMap(gpa.allocator());
-
-    defer env_map.deinit();
-
-    var ctx = Context{ .allocator = gpa.allocator(), .env_map = env_map, .writer = stdout };
-
-    var buffer: [1024]u8 = undefined;
-
-    while (true) {
-
-        try stdout.print("$ ", .{});
-
-        @memset(&buffer, 0);
-
-        const user_input = nextInput(stdin, &buffer);
-
-        if (user_input) |command| {
-
-            var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-
-            defer arena.deinit();
-
-            ctx.allocator = arena.allocator();
-
-            const result = try handleInput(ctx, command);
-
-            switch (result) {
-
-                .cont => {},
-
-                .exit => |code| return code,
-
-            }
+            try argv.append(arg);
 
         }
 
     }
+
+    // Convert ArrayList to slice for ChildProcess
+
+    const argv_slice = try argv.toOwnedSlice();
+
+    // spawn the process
+
+    const result = try std.process.Child.run(.{
+
+        .allocator = allocator,
+
+        .argv = argv_slice,
+
+        .max_output_bytes = 1024 * 1024,
+
+    });
+
+    if (result.stdout.len > 0) {
+
+        try stdout.print("{s}", .{result.stdout});
+
+    }
+
+}
+
+pub fn main() !void {
+
+    var shell = try Shell.init();
+
+    try shell.run();
+
+}
+
+const testing = std.testing;
+
+test "find_in_path finds command" {
+
+    const path = "/usr/bin:/bin"; // Example PATH, adjust as needed for your environment
+
+    const command = "ls"; // Assuming 'ls' exists in one of these directories
+
+    const result = find_in_path(path, command);
+
+    // Check if the result is not null, assuming the command exists in PATH
+
+    try testing.expect(result.?.len > 0);
+
+    // Optional: Check if the result path contains the command name
+
+    try testing.expect(std.mem.indexOf(u8, result.?, command) != null);
+
+}
+
+test "find_in_path command not found" {
+
+    const path = "/usr/bin:/bin"; // Example PATH where 'non_existent_command' does not exist
+
+    const command = "non_existent_command";
+
+    // Expecting the error 'CommandNotFound'
+
+    try testing.expectEqual(null, find_in_path(path, command));
+
+}
+
+test "shell command execution" {
+
+    var shell = try Shell.init();
+
+    defer shell.deinit();
+
+    try testing.expectEqual(try shell.executeCommand("echo hello"), 0);
+
+    // Add more test cases
 
 }
