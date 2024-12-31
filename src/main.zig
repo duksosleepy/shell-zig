@@ -1,195 +1,193 @@
 const std = @import("std");
 
-const process = std.process;
-
-const stdout = std.io.getStdOut().writer();
-
-const mem = std.mem;
-
-const fmt = std.fmt;
-
-const fs = std.fs;
-
-const allocator = std.heap.page_allocator;
-
-const BuiltIn = enum {
-
-    echo,
-
-    exit,
-
-    type,
-
-    pwd,
-
-};
-
-const BuiltInHandler = *const fn (args: []const u8) anyerror!void;
-
-var handlers = std.AutoHashMap(BuiltIn, BuiltInHandler).init(allocator);
-
 pub fn main() !void {
 
-    var buffer: [1024]u8 = undefined;
+    const stdout = std.io.getStdOut().writer();
 
-    defer handlers.deinit();
-
-    try handlers.put(.exit, handle_exit);
-
-    try handlers.put(.echo, handle_echo);
-
-    try handlers.put(.type, handle_type);
-
-    try handlers.put(.pwd, handle_pwd);
+    const stdin = std.io.getStdIn().reader();
 
     while (true) {
 
         try stdout.print("$ ", .{});
 
-        const stdin = std.io.getStdIn().reader();
+        var buffer: [1024]u8 = undefined;
 
         const user_input = try stdin.readUntilDelimiter(&buffer, '\n');
 
-        try handle_command(user_input);
+        var it = std.mem.split(u8, user_input, " ");
 
-    }
+        const command = it.next().?;
 
-}
+        if (std.mem.eql(u8, command, "exit")) {
 
-fn handle_command(input: []const u8) !void {
+            _ = it.next().?;
 
-    var input_slices = mem.splitScalar(u8, input, ' ');
+            std.process.exit(0);
 
-    const cmd_str = input_slices.first();
+        } else if (std.mem.eql(u8, command, "echo")) {
 
-    const args = input_slices.rest();
+            const arg = it.next().?;
 
-    const builtin = std.meta.stringToEnum(BuiltIn, cmd_str);
+            try stdout.print("{s}", .{arg});
 
-    if (builtin) |bi| {
+            while (it.next()) |a| {
 
-        const handler = handlers.get(bi).?;
+                try stdout.print(" {s}", .{a});
 
-        try handler(args);
+            }
 
-    } else {
+            try stdout.print("\n", .{});
 
-        try handle_default(cmd_str, args);
+        } else if (std.mem.eql(u8, command, "type")) {
 
-    }
+            const arg = it.next().?;
 
-}
+            if (std.mem.eql(u8, arg, "echo")) {
 
-fn handle_echo(args: []const u8) !void {
+                try stdout.print("echo is a shell builtin\n", .{});
 
-    try stdout.print("{s}\n", .{args});
+            } else if (std.mem.eql(u8, arg, "exit")) {
 
-}
+                try stdout.print("exit is a shell builtin\n", .{});
 
-fn handle_exit(args: []const u8) !void {
+            } else if (std.mem.eql(u8, arg, "type")) {
 
-    const exit_code = fmt.parseInt(u8, args, 10) catch 0;
+                try stdout.print("type is a shell builtin\n", .{});
 
-    process.exit(exit_code);
+            } else if (std.mem.eql(u8, arg, "pwd")) {
 
-}
+                try stdout.print("pwd is a shell builtin\n", .{});
 
-fn handle_type(args: []const u8) !void {
+            } else if (std.mem.eql(u8, arg, "cd")) {
 
-    const builtin = std.meta.stringToEnum(BuiltIn, args);
+                try stdout.print("cd is a shell builtin\n", .{});
 
-    if (builtin) |bi| {
+            } else {
 
-        try stdout.print("{s} is a shell builtin\n", .{@tagName(bi)});
+                const command_path = find_in_path(arg) catch {
 
-        return;
+                    try stdout.print("{s}: not found\n", .{arg});
 
-    }
+                    continue;
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
+                };
 
-    defer arena.deinit();
+                try stdout.print("{s} is {s}\n", .{ arg, command_path });
 
-    const arena_alloc = arena.allocator();
+            }
 
-    if (try lookup_command(args, arena_alloc)) |path| {
+        } else if (std.mem.eql(u8, command, "pwd")) {
 
-        try stdout.print("{s} is {s}\n", .{ args, path });
+            var buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
 
-    } else {
+            const cwd = try std.process.getCwd(&buf);
 
-        try stdout.print("{s}: not found\n", .{args});
+            try stdout.print("{s}\n", .{cwd});
 
-    }
+        } else if (std.mem.eql(u8, command, "cd")) {
 
-}
+            const arg = it.next().?;
 
-fn handle_pwd(_: []const u8) !void {
+            // try std.process.chdir(arg);
 
-    const path = try fs.cwd().realpathAlloc(allocator, ".");
+            var dir = std.fs.cwd().openDir(arg, .{}) catch {
 
-    defer allocator.free(path);
+                try stdout.print("cd: {s}: No such file or directory\n", .{arg});
 
-    try stdout.print("{s}\n", .{path});
+                continue;
 
-}
+            };
 
-fn handle_default(cmd: []const u8, args: []const u8) !void {
+            defer dir.close();
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
+            try dir.setAsCwd();
 
-    defer arena.deinit();
+        } else {
 
-    const arena_alloc = arena.allocator();
+            _ = find_in_path(command) catch {
 
-    const path = try lookup_command(cmd, arena_alloc) orelse {
+                try stdout.print("{s}: command not found\n", .{command});
 
-        try stdout.print("{s}: command not found\n", .{cmd});
+                continue;
 
-        return;
+            };
 
-    };
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-    var argv = std.ArrayList([]const u8).init(arena_alloc);
+            defer arena.deinit();
 
-    try argv.append(path);
+            const allocator = arena.allocator();
 
-    var args_iter = mem.splitScalar(u8, args, ' ');
+            var arg_list = std.ArrayList([]const u8).init(allocator);
 
-    while (args_iter.next()) |arg| {
+            defer arg_list.deinit();
 
-        try argv.append(arg);
+            try arg_list.append(command);
 
-    }
+            while (it.next()) |arg| {
 
-    var proc = process.Child.init(argv.items, arena_alloc);
+                try arg_list.append(arg);
 
-    _ = try proc.spawnAndWait();
+            }
 
-}
+            var childArena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-fn lookup_command(cmd: []const u8, alloc: std.mem.Allocator) !?[]const u8 {
+            defer childArena.deinit();
 
-    const path_var = try process.getEnvVarOwned(alloc, "PATH");
+            const childAllocator = childArena.allocator();
 
-    var path_iter = mem.splitScalar(u8, path_var, fs.path.delimiter);
+            var child = std.process.Child.init(arg_list.items, childAllocator);
 
-    while (path_iter.next()) |dir_path| {
+            try child.spawn();
 
-        const dir = fs.openDirAbsolute(dir_path, .{}) catch continue;
-
-        const file_stat = dir.statFile(cmd) catch continue;
-
-        if (file_stat.mode & std.c.S.IXUSR == 0) {
-
-            continue;
+            _ = try child.wait();
 
         }
 
-        return try fmt.allocPrint(alloc, "{s}{c}{s}", .{ dir_path, fs.path.sep, cmd });
+    }
+
+}
+
+fn find_in_path(command: []const u8) ![]const u8 {
+
+    const allocator = std.heap.page_allocator;
+
+    const memory = try allocator.alloc(u8, 100);
+
+    defer allocator.free(memory);
+
+    const env = try std.process.getEnvMap(allocator);
+
+    const path = std.process.EnvMap.get(env, "PATH").?;
+
+    var dirs = std.mem.split(u8, path, ":");
+
+    while (dirs.next()) |dir| {
+
+        var files = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+
+        defer files.close();
+
+        var fs_iter = files.iterate();
+
+        while (try fs_iter.next()) |f| {
+
+            if (std.mem.eql(u8, f.name, command)) {
+
+                const memory2 = try allocator.alloc(u8, 100);
+
+                defer allocator.free(memory2);
+
+                const joined = try std.fs.path.join(allocator, &[_][]const u8{ dir, f.name });
+
+                return joined;
+
+            }
+
+        }
 
     }
 
-    return null;
+    return error.Oops;
 
 }
